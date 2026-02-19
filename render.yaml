@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: weight-room-api
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: WEIGHT_ROOM_SUPABASE_URL
+        sync: false
+      - key: WEIGHT_ROOM_SUPABASE_SERVICE_KEY
+        sync: false
+      - key: WEIGHT_ROOM_SUPABASE_JWT_SECRET
+        sync: false
