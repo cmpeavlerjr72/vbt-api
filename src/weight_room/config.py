@@ -1,11 +1,15 @@
 """Centralized settings for the weight-room backend."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
+
+_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 
 class Settings(BaseSettings):
-    model_config = {"env_prefix": "WEIGHT_ROOM_", "env_file": ".env"}
+    model_config = {"env_prefix": "WEIGHT_ROOM_", "env_file": str(_ENV_FILE)}
 
     # Supabase — empty strings mean disabled (graceful fallback)
     supabase_url: str = ""
