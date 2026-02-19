@@ -36,7 +36,7 @@ def lookup_rfid_tag(uid: str = Query(...), user_id: str = Depends(get_current_us
     except Exception as exc:
         log.exception("rfid lookup failed for uid=%s", uid)
         raise HTTPException(status_code=500, detail=f"RFID lookup failed: {exc}")
-    return resp.data
+    return resp.data if resp else None
 
 
 @router.post("/rfid/tags", response_model=RfidTagOut, status_code=201)
