@@ -220,6 +220,11 @@ class VbtSetSummaryOut(BaseModel):
     created_at: str
 
 
+class VbtLeaderboardSetOut(VbtSetSummaryOut):
+    avg_conc_accel: Optional[float] = None
+    avg_ecc_accel: Optional[float] = None
+
+
 class VbtRepOut(BaseModel):
     id: str
     raw_set_id: str

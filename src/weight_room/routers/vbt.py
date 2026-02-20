@@ -6,7 +6,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from weight_room.auth import get_current_user
-from weight_room.core.models import VbtRepOut, VbtSetSummaryOut
+from weight_room.core.models import VbtLeaderboardSetOut, VbtRepOut, VbtSetSummaryOut
 from weight_room.db import get_supabase
 
 router = APIRouter(tags=["vbt"])
@@ -89,6 +89,75 @@ def team_set_summaries(
         row.pop("vbt_raw_sets", None)
         rows.append(row)
     return rows
+
+
+@router.get("/teams/{team_id}/vbt/leaderboard-sets", response_model=List[VbtLeaderboardSetOut])
+def team_leaderboard_sets(
+    team_id: str,
+    limit: int = Query(200, ge=1, le=500),
+    user_id: str = Depends(get_current_user),
+):
+    sb = _require_db()
+
+    # 1. Fetch set summaries for this team
+    sum_resp = (
+        sb.table("vbt_set_summaries")
+        .select("*, vbt_raw_sets!inner(team_id)")
+        .eq("vbt_raw_sets.team_id", team_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    summaries = []
+    raw_set_ids = set()
+    for row in sum_resp.data:
+        row.pop("vbt_raw_sets", None)
+        summaries.append(row)
+        raw_set_ids.add(row["raw_set_id"])
+
+    if not summaries:
+        return []
+
+    # 2. Fetch reps for those sets (conc_peak_accel, ecc_peak_accel only)
+    rep_resp = (
+        sb.table("vbt_reps")
+        .select("raw_set_id, conc_peak_accel, ecc_peak_accel")
+        .in_("raw_set_id", list(raw_set_ids))
+        .execute()
+    )
+
+    # 3. Compute per-set averages
+    accel_sums: dict[str, dict] = {}
+    for rep in rep_resp.data:
+        sid = rep["raw_set_id"]
+        if sid not in accel_sums:
+            accel_sums[sid] = {
+                "conc_total": 0.0, "conc_count": 0,
+                "ecc_total": 0.0, "ecc_count": 0,
+            }
+        if rep["conc_peak_accel"] is not None:
+            accel_sums[sid]["conc_total"] += rep["conc_peak_accel"]
+            accel_sums[sid]["conc_count"] += 1
+        if rep["ecc_peak_accel"] is not None:
+            accel_sums[sid]["ecc_total"] += rep["ecc_peak_accel"]
+            accel_sums[sid]["ecc_count"] += 1
+
+    # 4. Merge into summaries
+    result = []
+    for s in summaries:
+        sid = s["raw_set_id"]
+        acc = accel_sums.get(sid)
+        s["avg_conc_accel"] = (
+            round(acc["conc_total"] / acc["conc_count"], 4)
+            if acc and acc["conc_count"] > 0 else None
+        )
+        s["avg_ecc_accel"] = (
+            round(acc["ecc_total"] / acc["ecc_count"], 4)
+            if acc and acc["ecc_count"] > 0 else None
+        )
+        result.append(s)
+
+    return result
 
 
 @router.get("/teams/{team_id}/vbt/flagged-reps", response_model=List[VbtRepOut])
