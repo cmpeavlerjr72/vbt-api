@@ -236,6 +236,7 @@ class VbtRepOut(BaseModel):
     bar_path_deviation: Optional[float] = None
     conc_peak_accel: Optional[float] = None
     ecc_peak_velocity: Optional[float] = None
+    ecc_peak_accel: Optional[float] = None
     flagged: bool
     flag_reason: Optional[str] = None
     samples: list = []
@@ -387,6 +388,7 @@ class DeviceRepIn(BaseModel):
     eccentric_duration: Optional[float] = None
     conc_peak_accel: Optional[float] = None
     ecc_peak_velocity: Optional[float] = None
+    ecc_peak_accel: Optional[float] = None
     samples: List[VelSample] = []
 
 
