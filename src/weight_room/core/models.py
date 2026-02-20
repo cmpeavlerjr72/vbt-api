@@ -236,6 +236,7 @@ class VbtRepOut(BaseModel):
     bar_path_deviation: Optional[float] = None
     flagged: bool
     flag_reason: Optional[str] = None
+    samples: list = []
     created_at: str
 
 
@@ -370,6 +371,11 @@ class DevicePlayerOut(BaseModel):
     jersey_number: Optional[int] = None
 
 
+class VelSample(BaseModel):
+    t: int
+    v: float
+
+
 class DeviceRepIn(BaseModel):
     rep_number: int
     mean_velocity: float
@@ -377,6 +383,7 @@ class DeviceRepIn(BaseModel):
     rom_meters: Optional[float] = None
     concentric_duration: Optional[float] = None
     eccentric_duration: Optional[float] = None
+    samples: List[VelSample] = []
 
 
 class DeviceSetIn(BaseModel):

@@ -72,6 +72,7 @@ def create_set(body: DeviceSetIn):
                 "rom_meters": r.rom_meters,
                 "concentric_duration": r.concentric_duration,
                 "eccentric_duration": r.eccentric_duration,
+                "samples": [s.model_dump() for s in r.samples],
             })
         if rep_rows:
             sb.table("vbt_reps").insert(rep_rows).execute()

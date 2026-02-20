@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from weight_room.auth import get_current_user
 from weight_room.core.models import VbtRepOut, VbtSetSummaryOut
@@ -131,3 +131,33 @@ def player_prs(player_id: str, user_id: str = Depends(get_current_user)):
         if ex not in best:
             best[ex] = rep
     return list(best.values())
+
+
+@router.delete("/vbt/sets/{raw_set_id}", status_code=204)
+def delete_set(raw_set_id: str, user_id: str = Depends(get_current_user)):
+    sb = _require_db()
+
+    # Verify the set exists and belongs to a team coached by this user
+    set_resp = (
+        sb.table("vbt_raw_sets")
+        .select("id, team_id")
+        .eq("id", raw_set_id)
+        .execute()
+    )
+    if not set_resp.data:
+        raise HTTPException(status_code=404, detail="Set not found")
+
+    team_id = set_resp.data[0]["team_id"]
+    team_resp = (
+        sb.table("teams")
+        .select("coach_id")
+        .eq("id", team_id)
+        .execute()
+    )
+    if not team_resp.data or team_resp.data[0]["coach_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this set")
+
+    # Delete from vbt_raw_sets — CASCADE handles reps + summaries
+    sb.table("vbt_raw_sets").delete().eq("id", raw_set_id).execute()
+
+    return Response(status_code=204)
