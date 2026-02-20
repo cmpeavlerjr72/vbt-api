@@ -234,6 +234,8 @@ class VbtRepOut(BaseModel):
     time_to_peak_vel: Optional[float] = None
     velocity_loss_pct: Optional[float] = None
     bar_path_deviation: Optional[float] = None
+    conc_peak_accel: Optional[float] = None
+    ecc_peak_velocity: Optional[float] = None
     flagged: bool
     flag_reason: Optional[str] = None
     samples: list = []
@@ -383,6 +385,8 @@ class DeviceRepIn(BaseModel):
     rom_meters: Optional[float] = None
     concentric_duration: Optional[float] = None
     eccentric_duration: Optional[float] = None
+    conc_peak_accel: Optional[float] = None
+    ecc_peak_velocity: Optional[float] = None
     samples: List[VelSample] = []
 
 

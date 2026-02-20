@@ -72,6 +72,8 @@ def create_set(body: DeviceSetIn):
                 "rom_meters": r.rom_meters,
                 "concentric_duration": r.concentric_duration,
                 "eccentric_duration": r.eccentric_duration,
+                "conc_peak_accel": r.conc_peak_accel,
+                "ecc_peak_velocity": r.ecc_peak_velocity,
                 "samples": [s.model_dump() for s in r.samples],
             })
         if rep_rows:
