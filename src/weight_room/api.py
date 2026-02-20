@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from weight_room.db import get_supabase
 from weight_room.routers import (
     dashboard,
+    device,
     maxes,
     players,
     profiles,
@@ -36,6 +37,7 @@ app.include_router(workouts.router)
 app.include_router(rfid.router)
 app.include_router(vbt.router)
 app.include_router(dashboard.router)
+app.include_router(device.router)
 
 
 # ---------------------------------------------------------------------------

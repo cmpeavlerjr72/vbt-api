@@ -359,3 +359,34 @@ class LivePlayerActivity(BaseModel):
     repCount: int
     totalReps: int
     startedAt: str
+
+
+# ── Device (ESP32) Models ───────────────────────────────────────────────
+
+class DevicePlayerOut(BaseModel):
+    id: str
+    first_name: str
+    last_name: str
+    jersey_number: Optional[int] = None
+
+
+class DeviceRepIn(BaseModel):
+    rep_number: int
+    mean_velocity: float
+    peak_velocity: float
+    rom_meters: Optional[float] = None
+    concentric_duration: Optional[float] = None
+    eccentric_duration: Optional[float] = None
+
+
+class DeviceSetIn(BaseModel):
+    team_id: str
+    player_id: str
+    exercise: str
+    device_id: str
+    reps: List[DeviceRepIn]
+
+
+class DeviceSetOut(BaseModel):
+    set_id: str
+    reps_created: int
