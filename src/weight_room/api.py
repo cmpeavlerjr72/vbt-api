@@ -13,6 +13,7 @@ from weight_room.routers import (
     profiles,
     rfid,
     teams,
+    testing,
     vbt,
     workouts,
 )
@@ -33,6 +34,7 @@ app.include_router(profiles.router)
 app.include_router(teams.router)
 app.include_router(players.router)
 app.include_router(maxes.router)
+app.include_router(testing.router)
 app.include_router(workouts.router)
 app.include_router(rfid.router)
 app.include_router(vbt.router)

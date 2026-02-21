@@ -20,6 +20,7 @@
 
 #include <Wire.h>
 #include <TFT_eSPI.h>
+#include <driver/gpio.h>
 
 // ── Display ──
 TFT_eSPI tft = TFT_eSPI(240, 240);
@@ -47,8 +48,11 @@ TFT_eSPI tft = TFT_eSPI(240, 240);
 #define REG_BitFraming  0x0D
 #define REG_Coll        0x0E
 #define REG_Mode        0x11
+#define REG_TxMode      0x12
+#define REG_RxMode      0x13
 #define REG_TxControl   0x14
 #define REG_TxASK       0x15
+#define REG_ModWidth    0x24
 #define REG_TModeReg    0x2A
 #define REG_TPrescaler  0x2B
 #define REG_TReloadH    0x2C
@@ -63,14 +67,14 @@ TFT_eSPI tft = TFT_eSPI(240, 240);
 
 // PICC commands
 #define PICC_REQA       0x26
+#define PICC_WUPA       0x52
 #define PICC_ANTICOLL   0x93
-#define PICC_SELECT     0x93
 #define PICC_HLTA       0x50
 
 // ── Buttons ──
 #define BTN_GREEN  9
 #define BTN_RED   13
-#define BTN_YELLOW 10
+#define BTN_YELLOW 12
 
 // ── State ──
 bool imuOk   = false;
@@ -97,12 +101,12 @@ byte softSpiTransfer(byte data) {
   byte reply = 0;
   for (int i = 7; i >= 0; i--) {
     digitalWrite(RFID_MOSI, (data >> i) & 1);
-    delayMicroseconds(2);
+    delayMicroseconds(4);
     digitalWrite(RFID_SCK, HIGH);
-    delayMicroseconds(2);
-    reply |= (digitalRead(RFID_MISO) << i);
+    delayMicroseconds(4);
+    if (digitalRead(RFID_MISO)) reply |= (1 << i);
     digitalWrite(RFID_SCK, LOW);
-    delayMicroseconds(2);
+    delayMicroseconds(4);
   }
   return reply;
 }
@@ -110,20 +114,25 @@ byte softSpiTransfer(byte data) {
 byte rc522ReadReg(byte reg) {
   byte addr = ((reg << 1) & 0x7E) | 0x80;
   digitalWrite(RFID_SS, LOW);
-  delayMicroseconds(5);
+  delayMicroseconds(10);
   softSpiTransfer(addr);
+  delayMicroseconds(10);
   byte val = softSpiTransfer(0x00);
   digitalWrite(RFID_SS, HIGH);
+  delayMicroseconds(10);
   return val;
 }
 
 void rc522WriteReg(byte reg, byte val) {
   byte addr = (reg << 1) & 0x7E;
   digitalWrite(RFID_SS, LOW);
-  delayMicroseconds(5);
+  delayMicroseconds(10);
   softSpiTransfer(addr);
+  delayMicroseconds(10);
   softSpiTransfer(val);
+  delayMicroseconds(10);
   digitalWrite(RFID_SS, HIGH);
+  delayMicroseconds(10);
 }
 
 void rc522SetBitMask(byte reg, byte mask) {
@@ -138,15 +147,22 @@ void rc522ClearBitMask(byte reg, byte mask) {
 //  RC522 INIT & CARD PROTOCOL
 // ══════════════════════════════════════════════════════════════════════
 void rc522Init() {
-  // soft reset
-  rc522WriteReg(REG_Command, CMD_SoftReset);
-  delay(50);
+  // NO soft reset here — hard reset was already done in setup().
+  // The MFRC522 library skips soft reset after hard reset too.
+  // Doing a soft reset puts the chip into PowerDown mode which
+  // our bit-bang SPI can't reliably wake from.
 
-  // timer: auto-start, prescaler for ~25ms timeout
-  rc522WriteReg(REG_TModeReg, 0x8D);
-  rc522WriteReg(REG_TPrescaler, 0x3E);
-  rc522WriteReg(REG_TReloadH, 0x00);
-  rc522WriteReg(REG_TReloadL, 0x1E);
+  // reset baud rates and modulation width (match MFRC522 library exactly)
+  rc522WriteReg(REG_TxMode, 0x00);
+  rc522WriteReg(REG_RxMode, 0x00);
+  rc522WriteReg(REG_ModWidth, 0x26);
+
+  // timer: TAuto=1, prescaler=0x0A9=169 → f_timer=40kHz (25μs period)
+  // reload=0x03E8=1000 → 25ms timeout
+  rc522WriteReg(REG_TModeReg, 0x80);
+  rc522WriteReg(REG_TPrescaler, 0xA9);
+  rc522WriteReg(REG_TReloadH, 0x03);
+  rc522WriteReg(REG_TReloadL, 0xE8);
 
   // force 100% ASK modulation
   rc522WriteReg(REG_TxASK, 0x40);
@@ -160,45 +176,52 @@ void rc522Init() {
 
 // Communicate with a PICC via Transceive command
 // Returns 0 on success, non-zero on error
-byte rc522Transceive(byte *sendData, byte sendLen, byte *recvData, byte *recvLen, byte *validBits) {
+byte rc522Transceive(byte *sendData, byte sendLen, byte *recvData, byte *recvLen, byte *validBits, bool debug = false) {
+  byte txLastBits = validBits ? *validBits : 0;
+  byte bitFraming = txLastBits;  // rxAlign=0
+
+  rc522WriteReg(REG_Command, CMD_Idle);       // stop any active command
   rc522WriteReg(REG_ComIrq, 0x7F);           // clear all IRQ flags
-  rc522WriteReg(REG_Command, CMD_Idle);       // cancel any active command
-  rc522SetBitMask(REG_FIFOLevel, 0x80);      // flush FIFO
+  rc522WriteReg(REG_FIFOLevel, 0x80);        // flush FIFO (direct write, NOT read-modify-write)
 
   // write data to FIFO
   for (byte i = 0; i < sendLen; i++) {
     rc522WriteReg(REG_FIFOData, sendData[i]);
   }
 
-  // set bit framing for last byte
-  if (validBits) {
-    rc522WriteReg(REG_BitFraming, *validBits);
-  } else {
-    rc522WriteReg(REG_BitFraming, 0x00);
-  }
+  rc522WriteReg(REG_BitFraming, bitFraming);  // set bit framing
+  rc522WriteReg(REG_Command, CMD_Transceive); // execute command
+  rc522SetBitMask(REG_BitFraming, 0x80);      // StartSend
 
-  // execute Transceive
-  rc522WriteReg(REG_Command, CMD_Transceive);
-  rc522SetBitMask(REG_BitFraming, 0x80);     // StartSend
-
-  // wait for completion or timeout (~25ms)
-  unsigned long deadline = millis() + 50;
-  byte irq;
+  // wait for completion or timeout (~36ms)
+  const unsigned long deadline = millis() + 40;
+  bool completed = false;
+  byte irq = 0;
   do {
     irq = rc522ReadReg(REG_ComIrq);
-    if (irq & 0x30) break;  // RxIRq or IdleIRq
-    if (irq & 0x01) break;  // TimerIRq (timeout)
+    if (irq & 0x30) { completed = true; break; }  // RxIRq or IdleIRq
+    if (irq & 0x01) {                              // TimerIRq
+      if (debug) Serial.printf("  [transceive] TIMEOUT irq=0x%02X\n", irq);
+      return 1;
+    }
   } while (millis() < deadline);
 
-  rc522ClearBitMask(REG_BitFraming, 0x80);   // stop StartSend
+  rc522ClearBitMask(REG_BitFraming, 0x80);   // clear StartSend
 
-  if (irq & 0x01) return 1;  // timeout — no card
+  if (!completed) {
+    if (debug) Serial.printf("  [transceive] DEADLINE irq=0x%02X\n", irq);
+    return 1;
+  }
 
   byte errorReg = rc522ReadReg(REG_Error);
-  if (errorReg & 0x1B) return 2;  // BufferOvfl, CollErr, ParityErr, ProtocolErr
+  if (debug) Serial.printf("  [transceive] irq=0x%02X err=0x%02X\n", irq, errorReg);
+
+  if (errorReg & 0x13) return 2;  // BufferOvfl, ParityErr, ProtocolErr
 
   // read received data
   byte n = rc522ReadReg(REG_FIFOLevel);
+  if (debug) Serial.printf("  [transceive] FIFO=%d bytes\n", n);
+
   if (recvLen) {
     byte maxRead = *recvLen;
     *recvLen = n;
@@ -206,17 +229,18 @@ byte rc522Transceive(byte *sendData, byte sendLen, byte *recvData, byte *recvLen
   }
   for (byte i = 0; i < n; i++) {
     recvData[i] = rc522ReadReg(REG_FIFOData);
+    if (debug) Serial.printf("  [transceive] data[%d]=0x%02X\n", i, recvData[i]);
   }
 
   return 0;  // success
 }
 
-// Send REQA — returns true if a card responded
-bool rc522RequestCard(byte *atqa) {
-  rc522WriteReg(REG_BitFraming, 0x07);  // 7 valid bits in last byte (short frame)
-  byte cmd = PICC_REQA;
+// Send REQA or WUPA — returns true if a card responded
+bool rc522RequestCard(byte *atqa, bool wakeup = false) {
+  rc522ClearBitMask(REG_Coll, 0x80);    // ValuesAfterColl: clear to keep bits after collision
+  byte cmd = wakeup ? PICC_WUPA : PICC_REQA;
   byte recvLen = 2;
-  byte validBits = 0x07;
+  byte validBits = 0x07;  // short frame: 7 bits
   byte result = rc522Transceive(&cmd, 1, atqa, &recvLen, &validBits);
   return (result == 0 && recvLen == 2);
 }
@@ -263,7 +287,7 @@ void setup() {
   delay(500);
   Serial.println();
   Serial.println("=================================");
-  Serial.println("  HARDWARE CONNECTION TESTER");
+  Serial.println("  HARDWARE CONNECTION TESTER v4");
   Serial.println("=================================");
   Serial.println();
 
@@ -309,7 +333,14 @@ void setup() {
   }
 
   // — RC522 (software SPI) —
-  Serial.println("[RFID]  Testing RC522 via software SPI...");
+  // Forcibly reclaim RFID pins from SPI peripheral matrix
+  // (TFT_eSPI's init hijacks GPIOs through the ESP32 SPI hardware)
+  Serial.println("[RFID]  Reclaiming RFID pins from SPI peripheral...");
+  gpio_reset_pin((gpio_num_t)RFID_SS);
+  gpio_reset_pin((gpio_num_t)RFID_SCK);
+  gpio_reset_pin((gpio_num_t)RFID_MOSI);
+  gpio_reset_pin((gpio_num_t)RFID_MISO);
+  gpio_reset_pin((gpio_num_t)RFID_RST);
 
   pinMode(RFID_SS,   OUTPUT);
   pinMode(RFID_SCK,  OUTPUT);
@@ -322,10 +353,23 @@ void setup() {
   digitalWrite(RFID_MOSI, LOW);
 
   // hard reset
+  Serial.println("[RFID]  Hard reset...");
   digitalWrite(RFID_RST, LOW);
   delay(50);
   digitalWrite(RFID_RST, HIGH);
   delay(50);
+
+  // verify writes work: write 0xAA to TxModeReg, read back, restore
+  byte origTxMode = rc522ReadReg(REG_TxMode);
+  rc522WriteReg(REG_TxMode, 0xAA);
+  byte readback = rc522ReadReg(REG_TxMode);
+  rc522WriteReg(REG_TxMode, origTxMode);
+  Serial.printf("        Write test: wrote 0xAA to TxMode, read 0x%02X %s\n",
+    readback, readback == 0xAA ? "OK" : "FAIL");
+
+  // also read Command reg right after hard reset (before init)
+  byte cmdBeforeInit = rc522ReadReg(REG_Command);
+  Serial.printf("        Command before init = 0x%02X (expect 0x20)\n", cmdBeforeInit);
 
   byte version = rc522ReadReg(REG_Version);
   Serial.printf("        VersionReg = 0x%02X ", version);
@@ -333,8 +377,23 @@ void setup() {
   if (version == 0x91 || version == 0x92) {
     rfidOk = true;
     Serial.println("OK");
-    // full init for card scanning
     rc522Init();
+
+    // verify key registers after init
+    Serial.println("        Register dump after init:");
+    Serial.printf("          TxControl = 0x%02X (expect 0x03 bits set)\n", rc522ReadReg(REG_TxControl));
+    Serial.printf("          TxASK     = 0x%02X (expect 0x40)\n", rc522ReadReg(REG_TxASK));
+    Serial.printf("          Mode      = 0x%02X (expect 0x3D)\n", rc522ReadReg(REG_Mode));
+    Serial.printf("          TMode     = 0x%02X (expect 0x80)\n", rc522ReadReg(REG_TModeReg));
+    Serial.printf("          TPrescaler= 0x%02X (expect 0xA9)\n", rc522ReadReg(REG_TPrescaler));
+    Serial.printf("          TReloadH  = 0x%02X (expect 0x03)\n", rc522ReadReg(REG_TReloadH));
+    Serial.printf("          TReloadL  = 0x%02X (expect 0xE8)\n", rc522ReadReg(REG_TReloadL));
+    Serial.printf("          TxMode    = 0x%02X (expect 0x00)\n", rc522ReadReg(REG_TxMode));
+    Serial.printf("          RxMode    = 0x%02X (expect 0x00)\n", rc522ReadReg(REG_RxMode));
+    Serial.printf("          Command   = 0x%02X (expect 0x00=Idle)\n", rc522ReadReg(REG_Command));
+    Serial.printf("          ComIrq    = 0x%02X\n", rc522ReadReg(REG_ComIrq));
+    Serial.printf("          Error     = 0x%02X\n", rc522ReadReg(REG_Error));
+    Serial.printf("          FIFOLevel = 0x%02X\n", rc522ReadReg(REG_FIFOLevel));
     Serial.println("        Antenna ON — ready to scan cards");
   } else if (version == 0x00) {
     Serial.println("FAIL (no response — check wiring)");
@@ -380,7 +439,47 @@ void loop() {
   if (y) yellowSeen = true;
 
   if (changed) {
-    if (g) Serial.println("[BTN] GREEN  pressed  (GPIO 9)");
+    if (g) {
+      Serial.println("[BTN] GREEN  pressed  (GPIO 9)");
+      // debug RFID on green press
+      if (rfidOk) {
+        // write-verify test
+        rc522WriteReg(REG_TxMode, 0xAA);
+        byte rb = rc522ReadReg(REG_TxMode);
+        rc522WriteReg(REG_TxMode, 0x00);  // restore
+        Serial.printf("[RFID] Write test: wrote 0xAA, read 0x%02X %s\n",
+          rb, rb == 0xAA ? "OK" : "FAIL - WRITES BROKEN");
+
+        // dump key registers
+        Serial.printf("[RFID] Command=0x%02X TxControl=0x%02X TxASK=0x%02X Mode=0x%02X\n",
+          rc522ReadReg(REG_Command), rc522ReadReg(REG_TxControl),
+          rc522ReadReg(REG_TxASK), rc522ReadReg(REG_Mode));
+        Serial.printf("[RFID] TMode=0x%02X TPre=0x%02X TRH=0x%02X TRL=0x%02X\n",
+          rc522ReadReg(REG_TModeReg), rc522ReadReg(REG_TPrescaler),
+          rc522ReadReg(REG_TReloadH), rc522ReadReg(REG_TReloadL));
+
+        Serial.println("[RFID] Debug scan (hold card near reader)...");
+        byte atqa[2];
+        rc522ClearBitMask(REG_Coll, 0x80);
+        byte cmd = PICC_WUPA;
+        byte recvLen = 2;
+        byte validBits = 0x07;
+        byte result = rc522Transceive(&cmd, 1, atqa, &recvLen, &validBits, true);
+        Serial.printf("[RFID] WUPA result=%d recvLen=%d\n", result, recvLen);
+        if (result == 0) {
+          Serial.printf("[RFID] ATQA: %02X %02X\n", atqa[0], atqa[1]);
+          // try anti-collision
+          byte uid[5];
+          byte anticollCmd[2] = { PICC_ANTICOLL, 0x20 };
+          recvLen = 5;
+          result = rc522Transceive(anticollCmd, 2, uid, &recvLen, NULL, true);
+          Serial.printf("[RFID] AntiColl result=%d recvLen=%d\n", result, recvLen);
+          if (result == 0 && recvLen >= 4) {
+            Serial.printf("[RFID] UID: %02X:%02X:%02X:%02X\n", uid[0], uid[1], uid[2], uid[3]);
+          }
+        }
+      }
+    }
     if (r) Serial.println("[BTN] RED    pressed  (GPIO 13)");
     if (y) Serial.println("[BTN] YELLOW pressed  (GPIO 10)");
   }
@@ -390,7 +489,7 @@ void loop() {
     lastRfidCheck = millis();
 
     byte atqa[2];
-    if (rc522RequestCard(atqa)) {
+    if (rc522RequestCard(atqa, true)) {  // true = WUPA (wakes halted cards too)
       byte uid[5];
       if (rc522AntiCollision(uid)) {
         String uidStr = uidToString(uid, 4);

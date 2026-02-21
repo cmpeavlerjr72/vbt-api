@@ -110,6 +110,24 @@ class PlayerMaxUpsert(BaseModel):
     weight: float
 
 
+# ── Player Testing ──────────────────────────────────────────────────────────
+
+class PlayerTestingOut(BaseModel):
+    id: str
+    player_id: str
+    metric_name: str
+    value: float
+    unit: str
+    tested_at: str
+    created_at: str
+
+
+class PlayerTestingUpsert(BaseModel):
+    metric_name: str
+    value: float
+    unit: str
+
+
 # ── RFID ─────────────────────────────────────────────────────────────────────
 
 class RfidTagOut(BaseModel):

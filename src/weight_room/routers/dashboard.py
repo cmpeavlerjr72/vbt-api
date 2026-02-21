@@ -5,6 +5,7 @@ Replace with real queries as data flows in.
 """
 from __future__ import annotations
 
+import logging
 import random
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -28,6 +29,8 @@ from weight_room.core.models import (
     WorkoutSession,
 )
 from weight_room.db import get_supabase
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["dashboard"])
 
@@ -107,25 +110,16 @@ def coach_due_workouts(user_id: str = Depends(get_current_user)):
 
 # ─── Team Dashboard ─────────────────────────────────────────────────────────
 
-_MOCK_PLAYERS = [
-    {"id": "p1", "name": "Andre Davis", "jersey": 22, "pos": "Power"},
-    {"id": "p2", "name": "Marcus Williams", "jersey": 54, "pos": "Power"},
-    {"id": "p3", "name": "Chris Johnson", "jersey": 11, "pos": "Combo"},
-    {"id": "p4", "name": "Jaylen Carter", "jersey": 7, "pos": "Skill"},
-    {"id": "p5", "name": "Devon Mitchell", "jersey": 34, "pos": "Power"},
-    {"id": "p6", "name": "Tyler Brooks", "jersey": 88, "pos": "Combo"},
-    {"id": "p7", "name": "Isaiah Thompson", "jersey": 3, "pos": "Skill"},
-    {"id": "p8", "name": "Malik Robinson", "jersey": 45, "pos": "Power"},
-    {"id": "p9", "name": "Caleb Stewart", "jersey": 19, "pos": "Skill"},
-    {"id": "p10", "name": "Jordan Wright", "jersey": 66, "pos": "Combo"},
-]
+_METRIC_COLUMN = {
+    "avg_velocity": "avg_velocity",
+    "peak_velocity": "peak_velocity",
+    "est_1rm": "estimated_1rm",
+}
 
-_MOCK_RECORDS: Dict[str, dict] = {
-    "Back Squat": {"values": [315, 305, 285, 275, 270, 265, 255, 245, 240, 235], "unit": "lbs", "dates": ["2026-01-28", "2026-02-03", "2026-01-22", "2026-01-15", "2026-02-10", "2026-01-30", "2026-02-05", "2026-01-20", "2026-02-08", "2026-01-25"]},
-    "Bench Press": {"values": [275, 265, 245, 235, 225, 220, 215, 205, 200, 195], "unit": "lbs", "dates": ["2026-02-01", "2026-01-28", "2026-02-06", "2026-01-18", "2026-02-03", "2026-01-22", "2026-02-09", "2026-01-15", "2026-02-12", "2026-01-25"]},
-    "Power Clean": {"values": [265, 255, 245, 235, 225, 220, 215, 205, 200, 195], "unit": "lbs", "dates": ["2026-02-05", "2026-01-30", "2026-02-10", "2026-01-20", "2026-02-03", "2026-01-25", "2026-02-08", "2026-01-18", "2026-02-12", "2026-01-22"]},
-    "Hang Clean": {"values": [245, 235, 225, 220, 215, 205, 200, 195, 190, 185], "unit": "lbs", "dates": ["2026-02-06", "2026-01-28", "2026-02-03", "2026-01-20", "2026-02-10", "2026-01-25", "2026-02-08", "2026-01-15", "2026-02-12", "2026-01-22"]},
-    "Front Squat": {"values": [275, 265, 255, 245, 240, 235, 225, 220, 215, 210], "unit": "lbs", "dates": ["2026-02-01", "2026-01-30", "2026-02-07", "2026-01-22", "2026-02-05", "2026-01-18", "2026-02-10", "2026-01-28", "2026-02-12", "2026-01-25"]},
+_METRIC_UNIT = {
+    "avg_velocity": "m/s",
+    "peak_velocity": "m/s",
+    "est_1rm": "lbs",
 }
 
 
@@ -133,32 +127,63 @@ _MOCK_RECORDS: Dict[str, dict] = {
 def team_leaderboard(
     team_id: str,
     exercise: str = Query("Back Squat"),
-    metric: str = Query("max_weight"),
+    metric: str = Query("peak_velocity"),
     position_group: Optional[str] = Query(None),
     user_id: str = Depends(get_current_user),
 ):
-    rec = _MOCK_RECORDS.get(exercise)
-    if not rec:
+    sb = _require_db()
+    col = _METRIC_COLUMN.get(metric, "peak_velocity")
+    unit = _METRIC_UNIT.get(metric, "m/s")
+
+    # Fetch set summaries for this team + exercise, joined with player info
+    resp = (
+        sb.table("vbt_set_summaries")
+        .select(
+            "player_id, avg_velocity, peak_velocity, estimated_1rm, created_at, "
+            "vbt_raw_sets!inner(team_id), "
+            "players!inner(first_name, last_name, jersey_number, position_group)"
+        )
+        .eq("vbt_raw_sets.team_id", team_id)
+        .eq("exercise", exercise)
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    if not resp.data:
         return []
 
-    entries = [
-        LeaderboardEntry(
-            rank=i + 1,
-            playerId=p["id"],
-            playerName=p["name"],
-            jerseyNumber=p["jersey"],
-            positionGroup=p["pos"],
-            value=rec["values"][i],
-            unit=rec["unit"],
-            date=rec["dates"][i],
-        )
-        for i, p in enumerate(_MOCK_PLAYERS)
-    ]
+    # Find best set per player (highest value for selected metric)
+    best: Dict[str, dict] = {}
+    for row in resp.data:
+        pid = row["player_id"]
+        val = row.get(col)
+        if val is None:
+            continue
 
-    if position_group and position_group != "all":
-        entries = [e for e in entries if e.positionGroup == position_group]
-        for i, e in enumerate(entries):
-            e.rank = i + 1
+        player = row.get("players", {})
+
+        # Apply position filter early
+        pg = (player.get("position_group") or "skill").capitalize()
+        if position_group and position_group != "all" and pg != position_group:
+            continue
+
+        if pid not in best or val > best[pid]["value"]:
+            best[pid] = {
+                "playerId": pid,
+                "playerName": f'{player.get("first_name", "")} {player.get("last_name", "")}'.strip(),
+                "jerseyNumber": player.get("jersey_number") or 0,
+                "positionGroup": pg,
+                "value": round(float(val), 2),
+                "unit": unit,
+                "date": row.get("created_at", "")[:10],
+            }
+
+    # Sort descending by value, assign ranks
+    ranked = sorted(best.values(), key=lambda x: x["value"], reverse=True)
+    entries = [
+        LeaderboardEntry(rank=i + 1, **row)
+        for i, row in enumerate(ranked)
+    ]
 
     return entries
 
