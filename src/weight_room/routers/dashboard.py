@@ -84,6 +84,34 @@ def _eligible_player_ids(
     return {p["id"] for p in team_players}
 
 
+def _assignment_vbt_window(assignment, fallback_start, fallback_end):
+    """Derive VBT matching window for an assignment.
+
+    Matches the logic in _compute_exercise_progress (workouts.py):
+    - start: start_at, or start-of-day of due_at, or created_at
+    - end:   end-of-day of due_at, or fallback
+    """
+    start_at = assignment.get("start_at")
+    due_at = assignment.get("due_at")
+    created_at = assignment.get("created_at")
+
+    if start_at:
+        window_start = start_at
+    elif due_at:
+        window_start = due_at[:10] + "T00:00:00+00:00"
+    elif created_at:
+        window_start = created_at
+    else:
+        window_start = fallback_start
+
+    if due_at:
+        window_end = due_at[:10] + "T23:59:59+00:00"
+    else:
+        window_end = fallback_end
+
+    return window_start, window_end
+
+
 def _fetch_junction_map(sb, assignments: list) -> Dict[str, set]:
     """Batch-fetch workout_assignment_players for player-targeted assignments."""
     ids = [a["id"] for a in assignments if a.get("target_type") == "players"]
@@ -115,7 +143,7 @@ def _compute_compliance(sb, team_ids, players, since_iso, until_iso):
 
     assignments = (
         sb.table("workout_assignments")
-        .select("id, team_id, target_type, target_position_group, start_at, due_at")
+        .select("id, team_id, target_type, target_position_group, start_at, due_at, created_at")
         .in_("team_id", team_ids)
         .gte("due_at", since_iso)
         .lte("due_at", until_iso)
@@ -168,10 +196,9 @@ def _compute_compliance(sb, team_ids, players, since_iso, until_iso):
         started = {
             pid for (aid, pid) in log_pairs if aid == a["id"] and pid in eligible
         }
-        a_start = a.get("start_at") or since_iso
-        a_due = a.get("due_at") or until_iso
+        w_start, w_end = _assignment_vbt_window(a, since_iso, until_iso)
         for v in vbt_rows:
-            if v["player_id"] in eligible and a_start <= v["created_at"] <= a_due:
+            if v["player_id"] in eligible and w_start <= v["created_at"] <= w_end:
                 started.add(v["player_id"])
         team_started[tid] += len(started)
 
@@ -442,7 +469,7 @@ def coach_due_workouts(user_id: str = Depends(get_current_user)):
         sb.table("workout_assignments")
         .select(
             "id, team_id, template_id, target_type, target_position_group, "
-            "due_at, start_at, workout_templates(name)"
+            "due_at, start_at, created_at, workout_templates(name)"
         )
         .in_("team_id", team_ids)
         .gte("due_at", week_ago_iso)
@@ -494,10 +521,9 @@ def coach_due_workouts(user_id: str = Depends(get_current_user)):
 
         # Players who started (logs + VBT in the assignment window)
         started = log_started.get(a["id"], set()) & eligible
-        a_start = a.get("start_at") or week_ago_iso
-        a_due = a.get("due_at") or two_weeks_ahead_iso
+        w_start, w_end = _assignment_vbt_window(a, week_ago_iso, two_weeks_ahead_iso)
         for v in vbt_rows:
-            if v["player_id"] in eligible and a_start <= v["created_at"] <= a_due:
+            if v["player_id"] in eligible and w_start <= v["created_at"] <= w_end:
                 started.add(v["player_id"])
 
         template = a.get("workout_templates")
