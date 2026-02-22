@@ -44,9 +44,12 @@ def _require_db():
 
 # ─── Shared helpers ──────────────────────────────────────────────────────────
 
-def _get_coach_context(sb, user_id: str):
+def _get_coach_context(sb, user_id: str, *, include_archived: bool = False):
     """Fetch teams, team_ids, and players for a coach."""
-    teams = sb.table("teams").select("*").eq("coach_id", user_id).execute().data
+    q = sb.table("teams").select("*").eq("coach_id", user_id)
+    if not include_archived:
+        q = q.eq("archived", False)
+    teams = q.execute().data
     team_ids = [t["id"] for t in teams]
     players: list = []
     if team_ids:
@@ -354,9 +357,14 @@ def coach_stats(user_id: str = Depends(get_current_user)):
 
 
 @router.get("/coach/team-overviews", response_model=List[TeamOverview])
-def coach_team_overviews(user_id: str = Depends(get_current_user)):
+def coach_team_overviews(
+    include_archived: bool = Query(False),
+    user_id: str = Depends(get_current_user),
+):
     sb = _require_db()
-    teams, team_ids, players = _get_coach_context(sb, user_id)
+    teams, team_ids, players = _get_coach_context(
+        sb, user_id, include_archived=include_archived
+    )
 
     if not team_ids:
         return []
@@ -417,6 +425,7 @@ def coach_team_overviews(user_id: str = Depends(get_current_user)):
             workoutsThisWeek=workouts_per_team.get(t["id"], 0),
             compliancePercent=compliance_per_team.get(t["id"], 0),
             needsAttention=flagged_per_team.get(t["id"], 0),
+            archived=t.get("archived", False),
         )
         for t in teams
     ]

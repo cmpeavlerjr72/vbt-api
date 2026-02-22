@@ -37,6 +37,7 @@ class TeamOut(BaseModel):
     sport: str
     dashboard_config: Dict[str, Any] = {}
     tracked_columns: List[str] = []
+    archived: bool = False
     created_at: str
 
 
@@ -50,6 +51,7 @@ class TeamUpdate(BaseModel):
     sport: Optional[str] = None
     dashboard_config: Optional[Dict[str, Any]] = None
     tracked_columns: Optional[List[str]] = None
+    archived: Optional[bool] = None
 
 
 # ── Players ──────────────────────────────────────────────────────────────────
@@ -307,6 +309,7 @@ class TeamOverview(BaseModel):
     compliancePercent: int
     needsAttention: int
     workoutsThisWeek: int
+    archived: bool = False
 
 
 class ActivityItem(BaseModel):
