@@ -28,6 +28,7 @@ from weight_room.core.models import (
     WorkoutSession,
 )
 from weight_room.db import get_supabase
+from weight_room.routers.workouts import _parse_exercises
 
 logger = logging.getLogger(__name__)
 
@@ -129,21 +130,115 @@ def _fetch_junction_map(sb, assignments: list) -> Dict[str, set]:
     return junction
 
 
+def _compute_set_completion(sb, assignments, players, junction_map, since_iso, until_iso):
+    """Compute set-level completion for each assignment.
+
+    Returns dict: {assignment_id: (sets_done, sets_total, team_id)}
+    where totals are summed across all eligible players.
+    Matches the per-exercise logic in _compute_exercise_progress (workouts.py).
+    """
+    if not assignments:
+        return {}
+
+    pbt = _players_by_team(players)
+    assignment_ids = [a["id"] for a in assignments]
+
+    # Self-report logs: (assignment_id, player_id, exercise_name) -> sets_completed
+    log_data: Dict[tuple, int] = {}
+    try:
+        for row in (
+            sb.table("workout_exercise_logs")
+            .select("assignment_id, player_id, exercise_name, sets_completed")
+            .in_("assignment_id", assignment_ids)
+            .execute()
+            .data
+        ):
+            key = (row["assignment_id"], row["player_id"], row["exercise_name"])
+            log_data[key] = row.get("sets_completed", 0)
+    except Exception:
+        pass  # table may not exist yet
+
+    # VBT activity with exercise names, indexed for fast lookup
+    player_ids = [p["id"] for p in players]
+    vbt_index: Dict[tuple, list] = {}  # (player_id, exercise) -> [created_at, ...]
+
+    if player_ids:
+        # Compute broad query window from all assignment windows
+        all_windows = [
+            _assignment_vbt_window(a, since_iso, until_iso) for a in assignments
+        ]
+        earliest = min(w[0] for w in all_windows)
+        latest = max(w[1] for w in all_windows)
+
+        vbt_rows = (
+            sb.table("vbt_set_summaries")
+            .select("player_id, exercise, created_at")
+            .in_("player_id", player_ids)
+            .gte("created_at", earliest)
+            .lte("created_at", latest)
+            .execute()
+            .data
+        )
+        for v in vbt_rows:
+            vbt_index.setdefault((v["player_id"], v["exercise"]), []).append(
+                v["created_at"]
+            )
+
+    result: Dict[str, tuple] = {}
+
+    for a in assignments:
+        eligible = _eligible_player_ids(a, pbt, junction_map)
+
+        # Parse template exercises
+        template = a.get("workout_templates")
+        content = (
+            template.get("content", {})
+            if isinstance(template, dict) and template
+            else {}
+        )
+        exercises = _parse_exercises(content)
+
+        sets_per_player = sum(ex["sets_required"] for ex in exercises)
+        total_required = sets_per_player * len(eligible)
+
+        w_start, w_end = _assignment_vbt_window(a, since_iso, until_iso)
+
+        total_done = 0
+        for pid in eligible:
+            for ex in exercises:
+                name = ex["exercise_name"]
+                req = ex["sets_required"]
+                if ex["tracking_mode"] == "vbt":
+                    timestamps = vbt_index.get((pid, name), [])
+                    done = sum(
+                        1 for ts in timestamps if w_start <= ts <= w_end
+                    )
+                    total_done += min(done, req)
+                else:
+                    done = log_data.get((a["id"], pid, name), 0)
+                    total_done += min(done, req)
+
+        result[a["id"]] = (total_done, total_required, a["team_id"])
+
+    return result
+
+
 def _compute_compliance(sb, team_ids, players, since_iso, until_iso):
     """
-    Compliance percentages: per-team dict and overall pct.
+    Set-level compliance percentages: per-team dict and overall pct.
 
-    "Started" = player has any workout_exercise_logs row for the assignment
-    OR any vbt_set_summaries within the assignment's [start_at, due_at] window.
+    Counts actual sets completed vs sets required across all eligible
+    players, matching the calendar/completion page logic.
     """
     if not team_ids:
         return {}, 0
 
-    pbt = _players_by_team(players)
-
     assignments = (
         sb.table("workout_assignments")
-        .select("id, team_id, target_type, target_position_group, start_at, due_at, created_at")
+        .select(
+            "id, team_id, target_type, target_position_group, "
+            "start_at, due_at, created_at, workout_templates(content)"
+        )
         .in_("team_id", team_ids)
         .gte("due_at", since_iso)
         .lte("due_at", until_iso)
@@ -153,64 +248,28 @@ def _compute_compliance(sb, team_ids, players, since_iso, until_iso):
     if not assignments:
         return {tid: 0 for tid in team_ids}, 0
 
-    assignment_ids = [a["id"] for a in assignments]
     junction_map = _fetch_junction_map(sb, assignments)
+    completion = _compute_set_completion(
+        sb, assignments, players, junction_map, since_iso, until_iso
+    )
 
-    # Self-report logs -> (assignment_id, player_id) started pairs
-    log_pairs: set = set()
-    try:
-        for row in (
-            sb.table("workout_exercise_logs")
-            .select("assignment_id, player_id")
-            .in_("assignment_id", assignment_ids)
-            .execute()
-            .data
-        ):
-            log_pairs.add((row["assignment_id"], row["player_id"]))
-    except Exception:
-        pass  # table may not exist yet
+    # Aggregate by team
+    team_done: Dict[str, int] = {tid: 0 for tid in team_ids}
+    team_total: Dict[str, int] = {tid: 0 for tid in team_ids}
 
-    # VBT activity in the overall window
-    player_ids = [p["id"] for p in players]
-    vbt_rows: list = []
-    if player_ids:
-        vbt_rows = (
-            sb.table("vbt_set_summaries")
-            .select("player_id, created_at")
-            .in_("player_id", player_ids)
-            .gte("created_at", since_iso)
-            .lte("created_at", until_iso)
-            .execute()
-            .data
-        )
-
-    # Accumulate per-team
-    team_eligible: Dict[str, int] = {tid: 0 for tid in team_ids}
-    team_started: Dict[str, int] = {tid: 0 for tid in team_ids}
-
-    for a in assignments:
-        tid = a["team_id"]
-        eligible = _eligible_player_ids(a, pbt, junction_map)
-        team_eligible[tid] += len(eligible)
-
-        started = {
-            pid for (aid, pid) in log_pairs if aid == a["id"] and pid in eligible
-        }
-        w_start, w_end = _assignment_vbt_window(a, since_iso, until_iso)
-        for v in vbt_rows:
-            if v["player_id"] in eligible and w_start <= v["created_at"] <= w_end:
-                started.add(v["player_id"])
-        team_started[tid] += len(started)
+    for _aid, (done, total, tid) in completion.items():
+        team_done[tid] = team_done.get(tid, 0) + done
+        team_total[tid] = team_total.get(tid, 0) + total
 
     per_team = {
-        tid: round(team_started[tid] / team_eligible[tid] * 100)
-        if team_eligible[tid]
+        tid: round(team_done[tid] / team_total[tid] * 100)
+        if team_total[tid]
         else 0
         for tid in team_ids
     }
-    total_e = sum(team_eligible.values())
-    total_s = sum(team_started.values())
-    overall = round(total_s / total_e * 100) if total_e else 0
+    total_d = sum(team_done.values())
+    total_t = sum(team_total.values())
+    overall = round(total_d / total_t * 100) if total_t else 0
     return per_team, overall
 
 
@@ -469,7 +528,7 @@ def coach_due_workouts(user_id: str = Depends(get_current_user)):
         sb.table("workout_assignments")
         .select(
             "id, team_id, template_id, target_type, target_position_group, "
-            "due_at, start_at, created_at, workout_templates(name)"
+            "due_at, start_at, created_at, workout_templates(name, content)"
         )
         .in_("team_id", team_ids)
         .gte("due_at", week_ago_iso)
@@ -482,49 +541,16 @@ def coach_due_workouts(user_id: str = Depends(get_current_user)):
     if not assignments:
         return []
 
-    assignment_ids = [a["id"] for a in assignments]
     junction_map = _fetch_junction_map(sb, assignments)
-
-    # Completion from workout_exercise_logs
-    log_started: Dict[str, set] = {}  # assignment_id -> {player_ids}
-    try:
-        for row in (
-            sb.table("workout_exercise_logs")
-            .select("assignment_id, player_id")
-            .in_("assignment_id", assignment_ids)
-            .execute()
-            .data
-        ):
-            log_started.setdefault(row["assignment_id"], set()).add(row["player_id"])
-    except Exception:
-        pass
-
-    # Completion from VBT activity
-    player_ids = [p["id"] for p in players]
-    vbt_rows: list = []
-    if player_ids:
-        vbt_rows = (
-            sb.table("vbt_set_summaries")
-            .select("player_id, created_at")
-            .in_("player_id", player_ids)
-            .gte("created_at", week_ago_iso)
-            .lte("created_at", two_weeks_ahead_iso)
-            .execute()
-            .data
-        )
+    completion = _compute_set_completion(
+        sb, assignments, players, junction_map, week_ago_iso, two_weeks_ahead_iso
+    )
 
     target_labels = {"team": "Entire Team", "players": "Selected Players"}
 
     results: List[DueWorkout] = []
     for a in assignments:
-        eligible = _eligible_player_ids(a, pbt, junction_map)
-
-        # Players who started (logs + VBT in the assignment window)
-        started = log_started.get(a["id"], set()) & eligible
-        w_start, w_end = _assignment_vbt_window(a, week_ago_iso, two_weeks_ahead_iso)
-        for v in vbt_rows:
-            if v["player_id"] in eligible and w_start <= v["created_at"] <= w_end:
-                started.add(v["player_id"])
+        done, total, _tid = completion.get(a["id"], (0, 0, ""))
 
         template = a.get("workout_templates")
         template_name = (
@@ -546,8 +572,8 @@ def coach_due_workouts(user_id: str = Depends(get_current_user)):
                 teamName=team_names.get(a["team_id"], "Unknown Team"),
                 targetLabel=label,
                 dueAt=a.get("due_at", ""),
-                completedCount=len(started),
-                totalCount=len(eligible),
+                completedCount=done,
+                totalCount=total,
                 overdue=bool(a.get("due_at") and a["due_at"] < now_iso),
             )
         )
