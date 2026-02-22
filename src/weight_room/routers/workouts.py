@@ -194,7 +194,14 @@ def _compute_exercise_progress(
 
         if mode == "vbt":
             # Count vbt_set_summaries matching player + exercise within the window
-            window_start = start_at or created_at
+            if start_at:
+                window_start = start_at
+            elif due_at:
+                # Use start-of-day of due_at so retroactive assignments work
+                window_start = due_at[:10] + "T00:00:00+00:00"
+            else:
+                window_start = created_at
+
             q = (
                 sb.table("vbt_set_summaries")
                 .select("id", count="exact")
@@ -203,7 +210,9 @@ def _compute_exercise_progress(
                 .gte("created_at", window_start)
             )
             if due_at:
-                q = q.lte("created_at", due_at)
+                # Use end-of-day so all sets on the due date are captured
+                window_end = due_at[:10] + "T23:59:59+00:00"
+                q = q.lte("created_at", window_end)
             resp = q.execute()
             sets_done = resp.count if resp.count is not None else len(resp.data)
         else:
