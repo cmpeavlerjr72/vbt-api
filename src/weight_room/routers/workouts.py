@@ -129,3 +129,11 @@ def create_assignment(body: WorkoutAssignmentCreate, user_id: str = Depends(get_
         sb.table("workout_assignment_players").insert(junction_rows).execute()
 
     return assignment
+
+
+@router.delete("/assignments/{assignment_id}", status_code=204)
+def delete_assignment(assignment_id: str, user_id: str = Depends(get_current_user)):
+    sb = _require_db()
+    # Delete junction rows first, then the assignment itself
+    sb.table("workout_assignment_players").delete().eq("assignment_id", assignment_id).execute()
+    sb.table("workout_assignments").delete().eq("id", assignment_id).execute()

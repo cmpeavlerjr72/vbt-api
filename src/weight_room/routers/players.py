@@ -49,23 +49,7 @@ def create_player(team_id: str, body: PlayerCreate, user_id: str = Depends(get_c
     return resp.data[0]
 
 
-@router.put("/players/{player_id}", response_model=PlayerOut)
-def update_player(player_id: str, body: PlayerUpdate, user_id: str = Depends(get_current_user)):
-    sb = _require_db()
-    patch = {k: v for k, v in body.model_dump(exclude_unset=True).items()}
-    if not patch:
-        raise HTTPException(status_code=400, detail="No fields to update")
-    resp = sb.table("players").update(patch).eq("id", player_id).execute()
-    if not resp.data:
-        raise HTTPException(status_code=404, detail="Player not found")
-    return resp.data[0]
-
-
-@router.delete("/players/{player_id}", status_code=204)
-def delete_player(player_id: str, user_id: str = Depends(get_current_user)):
-    sb = _require_db()
-    sb.table("players").delete().eq("id", player_id).execute()
-
+# ── Static /players/* paths BEFORE the {player_id} wildcard ──────────────
 
 @router.post("/players/claim", response_model=PlayerOut)
 def claim_invite(body: ClaimInviteRequest, user_id: str = Depends(get_current_user)):
@@ -104,3 +88,32 @@ def get_my_player(user_id: str = Depends(get_current_user)):
     )
     player["teams"] = t_resp.data
     return player
+
+
+# ── /players/{player_id} wildcard routes ─────────────────────────────────
+
+@router.get("/players/{player_id}", response_model=PlayerOut)
+def get_player(player_id: str, user_id: str = Depends(get_current_user)):
+    sb = _require_db()
+    resp = sb.table("players").select("*").eq("id", player_id).maybe_single().execute()
+    if not resp.data:
+        raise HTTPException(status_code=404, detail="Player not found")
+    return resp.data
+
+
+@router.put("/players/{player_id}", response_model=PlayerOut)
+def update_player(player_id: str, body: PlayerUpdate, user_id: str = Depends(get_current_user)):
+    sb = _require_db()
+    patch = {k: v for k, v in body.model_dump(exclude_unset=True).items()}
+    if not patch:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    resp = sb.table("players").update(patch).eq("id", player_id).execute()
+    if not resp.data:
+        raise HTTPException(status_code=404, detail="Player not found")
+    return resp.data[0]
+
+
+@router.delete("/players/{player_id}", status_code=204)
+def delete_player(player_id: str, user_id: str = Depends(get_current_user)):
+    sb = _require_db()
+    sb.table("players").delete().eq("id", player_id).execute()
