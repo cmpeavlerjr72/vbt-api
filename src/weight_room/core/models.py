@@ -36,6 +36,7 @@ class TeamOut(BaseModel):
     name: str
     sport: str
     dashboard_config: Dict[str, Any] = {}
+    tracked_columns: List[str] = []
     created_at: str
 
 
@@ -48,6 +49,7 @@ class TeamUpdate(BaseModel):
     name: Optional[str] = None
     sport: Optional[str] = None
     dashboard_config: Optional[Dict[str, Any]] = None
+    tracked_columns: Optional[List[str]] = None
 
 
 # ── Players ──────────────────────────────────────────────────────────────────
