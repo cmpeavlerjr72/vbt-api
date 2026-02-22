@@ -186,6 +186,7 @@ class TemplateExercise(BaseModel):
     exerciseName: str
     setGroups: List[SetGroup]
     notes: Optional[str] = None
+    trackingMode: Literal["vbt", "self_report"] = "self_report"
 
 
 class WorkoutContent(BaseModel):
@@ -447,3 +448,50 @@ class DeviceSetIn(BaseModel):
 class DeviceSetOut(BaseModel):
     set_id: str
     reps_created: int
+
+
+# ── Workout Logging ─────────────────────────────────────────────────────
+
+class WorkoutExerciseLogIn(BaseModel):
+    exercise_name: str
+    weight_lbs: Optional[float] = None
+    sets_completed: int = 0
+    reps_per_set: Optional[int] = None
+    notes: Optional[str] = None
+
+
+class WorkoutExerciseLogOut(BaseModel):
+    id: str
+    assignment_id: str
+    player_id: str
+    exercise_name: str
+    weight_lbs: Optional[float] = None
+    sets_completed: int
+    reps_per_set: Optional[int] = None
+    notes: Optional[str] = None
+    logged_at: str
+    created_at: str
+
+
+class ExerciseProgress(BaseModel):
+    exercise_name: str
+    tracking_mode: str  # 'vbt' | 'self_report'
+    sets_required: int
+    sets_completed: int
+    weight_lbs: Optional[float] = None
+    reps_per_set: Optional[int] = None
+
+
+class ActiveWorkout(BaseModel):
+    assignment_id: str
+    template_name: str
+    due_at: Optional[str] = None
+    exercises: List[ExerciseProgress]
+
+
+class PlayerProgress(BaseModel):
+    player_id: str
+    player_name: str
+    jersey_number: Optional[int] = None
+    position_group: str
+    exercises: List[ExerciseProgress]
