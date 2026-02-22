@@ -4,10 +4,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from weight_room.auth import get_current_user
-from weight_room.core.models import PlayerTestingOut, PlayerTestingUpsert
+from weight_room.core.models import PlayerTestingHistoryOut, PlayerTestingOut, PlayerTestingUpsert
 from weight_room.db import get_supabase
 
 router = APIRouter(tags=["testing"])
@@ -38,6 +38,26 @@ def upsert_player_testing(
     player_id: str, body: PlayerTestingUpsert, user_id: str = Depends(get_current_user)
 ):
     sb = _require_db()
+
+    # Archive the existing value to history before overwriting
+    existing = (
+        sb.table("player_testing")
+        .select("*")
+        .eq("player_id", player_id)
+        .eq("metric_name", body.metric_name)
+        .maybe_single()
+        .execute()
+    )
+    if existing.data:
+        sb.table("player_testing_history").insert({
+            "player_id": existing.data["player_id"],
+            "metric_name": existing.data["metric_name"],
+            "value": existing.data["value"],
+            "unit": existing.data["unit"],
+            "tested_at": existing.data["tested_at"],
+        }).execute()
+
+    # Upsert the new current value
     resp = (
         sb.table("player_testing")
         .upsert(
@@ -53,6 +73,24 @@ def upsert_player_testing(
         .execute()
     )
     return resp.data[0]
+
+
+@router.get("/players/{player_id}/testing/history", response_model=List[PlayerTestingHistoryOut])
+def list_player_testing_history(
+    player_id: str,
+    metric: str = Query(None),
+    user_id: str = Depends(get_current_user),
+):
+    sb = _require_db()
+    q = (
+        sb.table("player_testing_history")
+        .select("*")
+        .eq("player_id", player_id)
+    )
+    if metric:
+        q = q.eq("metric_name", metric)
+    resp = q.order("tested_at", desc=True).execute()
+    return resp.data
 
 
 @router.get("/teams/{team_id}/testing", response_model=List[PlayerTestingOut])

@@ -4,10 +4,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from weight_room.auth import get_current_user
-from weight_room.core.models import PlayerMaxOut, PlayerMaxUpsert
+from weight_room.core.models import PlayerMaxHistoryOut, PlayerMaxOut, PlayerMaxUpsert
 from weight_room.db import get_supabase
 
 router = APIRouter(tags=["maxes"])
@@ -38,6 +38,25 @@ def upsert_player_max(
     player_id: str, body: PlayerMaxUpsert, user_id: str = Depends(get_current_user)
 ):
     sb = _require_db()
+
+    # Archive the existing value to history before overwriting
+    existing = (
+        sb.table("player_maxes")
+        .select("*")
+        .eq("player_id", player_id)
+        .eq("exercise", body.exercise)
+        .maybe_single()
+        .execute()
+    )
+    if existing.data:
+        sb.table("player_max_history").insert({
+            "player_id": existing.data["player_id"],
+            "exercise": existing.data["exercise"],
+            "weight": existing.data["weight"],
+            "tested_at": existing.data["tested_at"],
+        }).execute()
+
+    # Upsert the new current value
     resp = (
         sb.table("player_maxes")
         .upsert(
@@ -52,6 +71,24 @@ def upsert_player_max(
         .execute()
     )
     return resp.data[0]
+
+
+@router.get("/players/{player_id}/maxes/history", response_model=List[PlayerMaxHistoryOut])
+def list_player_max_history(
+    player_id: str,
+    exercise: str = Query(None),
+    user_id: str = Depends(get_current_user),
+):
+    sb = _require_db()
+    q = (
+        sb.table("player_max_history")
+        .select("*")
+        .eq("player_id", player_id)
+    )
+    if exercise:
+        q = q.eq("exercise", exercise)
+    resp = q.order("tested_at", desc=True).execute()
+    return resp.data
 
 
 @router.get("/teams/{team_id}/maxes", response_model=List[PlayerMaxOut])
