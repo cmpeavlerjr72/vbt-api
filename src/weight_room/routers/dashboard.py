@@ -1,12 +1,11 @@
 """Dashboard endpoints.
 
-Returns mock data initially — same shapes the frontend currently hardcodes.
-Replace with real queries as data flows in.
+Real coach dashboard data from DB queries.
+Team/player dashboards still return mock data.
 """
 from __future__ import annotations
 
 import logging
-import random
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
@@ -42,70 +41,492 @@ def _require_db():
     return sb
 
 
+# ─── Shared helpers ──────────────────────────────────────────────────────────
+
+def _get_coach_context(sb, user_id: str):
+    """Fetch teams, team_ids, and players for a coach."""
+    teams = sb.table("teams").select("*").eq("coach_id", user_id).execute().data
+    team_ids = [t["id"] for t in teams]
+    players: list = []
+    if team_ids:
+        players = sb.table("players").select("*").in_("team_id", team_ids).execute().data
+    return teams, team_ids, players
+
+
+def _week_bounds() -> tuple:
+    """Return (monday_iso, next_monday_iso) for the current week (Mon-Sun)."""
+    now = datetime.now(timezone.utc)
+    monday = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(
+        days=now.weekday()
+    )
+    return monday.isoformat(), (monday + timedelta(days=7)).isoformat()
+
+
+def _players_by_team(players: list) -> Dict[str, list]:
+    """Group players into {team_id: [player, ...]}."""
+    result: Dict[str, list] = {}
+    for p in players:
+        result.setdefault(p["team_id"], []).append(p)
+    return result
+
+
+def _eligible_player_ids(
+    assignment: dict, pbt: Dict[str, list], junction_map: Dict[str, set]
+) -> set:
+    """Return set of player IDs eligible for an assignment."""
+    team_players = pbt.get(assignment["team_id"], [])
+    target = assignment.get("target_type", "team")
+    if target == "position_group":
+        pg = assignment.get("target_position_group")
+        return {p["id"] for p in team_players if p.get("position_group") == pg}
+    if target == "players":
+        return junction_map.get(assignment["id"], set())
+    return {p["id"] for p in team_players}
+
+
+def _fetch_junction_map(sb, assignments: list) -> Dict[str, set]:
+    """Batch-fetch workout_assignment_players for player-targeted assignments."""
+    ids = [a["id"] for a in assignments if a.get("target_type") == "players"]
+    if not ids:
+        return {}
+    junction: Dict[str, set] = {}
+    for row in (
+        sb.table("workout_assignment_players")
+        .select("assignment_id, player_id")
+        .in_("assignment_id", ids)
+        .execute()
+        .data
+    ):
+        junction.setdefault(row["assignment_id"], set()).add(row["player_id"])
+    return junction
+
+
+def _compute_compliance(sb, team_ids, players, since_iso, until_iso):
+    """
+    Compliance percentages: per-team dict and overall pct.
+
+    "Started" = player has any workout_exercise_logs row for the assignment
+    OR any vbt_set_summaries within the assignment's [start_at, due_at] window.
+    """
+    if not team_ids:
+        return {}, 0
+
+    pbt = _players_by_team(players)
+
+    assignments = (
+        sb.table("workout_assignments")
+        .select("id, team_id, target_type, target_position_group, start_at, due_at")
+        .in_("team_id", team_ids)
+        .gte("due_at", since_iso)
+        .lte("due_at", until_iso)
+        .execute()
+        .data
+    )
+    if not assignments:
+        return {tid: 0 for tid in team_ids}, 0
+
+    assignment_ids = [a["id"] for a in assignments]
+    junction_map = _fetch_junction_map(sb, assignments)
+
+    # Self-report logs -> (assignment_id, player_id) started pairs
+    log_pairs: set = set()
+    try:
+        for row in (
+            sb.table("workout_exercise_logs")
+            .select("assignment_id, player_id")
+            .in_("assignment_id", assignment_ids)
+            .execute()
+            .data
+        ):
+            log_pairs.add((row["assignment_id"], row["player_id"]))
+    except Exception:
+        pass  # table may not exist yet
+
+    # VBT activity in the overall window
+    player_ids = [p["id"] for p in players]
+    vbt_rows: list = []
+    if player_ids:
+        vbt_rows = (
+            sb.table("vbt_set_summaries")
+            .select("player_id, created_at")
+            .in_("player_id", player_ids)
+            .gte("created_at", since_iso)
+            .lte("created_at", until_iso)
+            .execute()
+            .data
+        )
+
+    # Accumulate per-team
+    team_eligible: Dict[str, int] = {tid: 0 for tid in team_ids}
+    team_started: Dict[str, int] = {tid: 0 for tid in team_ids}
+
+    for a in assignments:
+        tid = a["team_id"]
+        eligible = _eligible_player_ids(a, pbt, junction_map)
+        team_eligible[tid] += len(eligible)
+
+        started = {
+            pid for (aid, pid) in log_pairs if aid == a["id"] and pid in eligible
+        }
+        a_start = a.get("start_at") or since_iso
+        a_due = a.get("due_at") or until_iso
+        for v in vbt_rows:
+            if v["player_id"] in eligible and a_start <= v["created_at"] <= a_due:
+                started.add(v["player_id"])
+        team_started[tid] += len(started)
+
+    per_team = {
+        tid: round(team_started[tid] / team_eligible[tid] * 100)
+        if team_eligible[tid]
+        else 0
+        for tid in team_ids
+    }
+    total_e = sum(team_eligible.values())
+    total_s = sum(team_started.values())
+    overall = round(total_s / total_e * 100) if total_e else 0
+    return per_team, overall
+
+
 # ─── Coach Dashboard ────────────────────────────────────────────────────────
+
 
 @router.get("/coach/stats", response_model=List[StatCard])
 def coach_stats(user_id: str = Depends(get_current_user)):
     sb = _require_db()
-    resp = sb.table("teams").select("id").eq("coach_id", user_id).execute()
-    team_count = len(resp.data)
-    total_players = team_count * 28  # mock avg roster size
+    teams, team_ids, players = _get_coach_context(sb, user_id)
+
+    total_players = len(players)
+    active_players = sum(1 for p in players if p.get("linked_user_id"))
+
+    if not team_ids:
+        return [
+            StatCard(label="Active Players", value=0, subtext="of 0 total", color="blue"),
+            StatCard(label="Assigned This Week", value=0, subtext="across all teams", color="blue"),
+            StatCard(label="Compliance Rate", value="0%", subtext="no assignments yet", color="green"),
+            StatCard(label="Flagged Sessions", value=0, subtext="last 7 days", color="blue"),
+        ]
+
+    # Assignments created this week
+    monday, _ = _week_bounds()
+    assigned_this_week = len(
+        sb.table("workout_assignments")
+        .select("id")
+        .in_("team_id", team_ids)
+        .gte("created_at", monday)
+        .execute()
+        .data
+    )
+
+    # Flagged VBT sets in last 7 days
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    player_ids = [p["id"] for p in players]
+    flagged_count = 0
+    if player_ids:
+        flagged_count = len(
+            sb.table("vbt_set_summaries")
+            .select("id")
+            .in_("player_id", player_ids)
+            .eq("flagged", True)
+            .gte("created_at", week_ago)
+            .execute()
+            .data
+        )
+
+    # Compliance (last 14 days)
+    two_weeks_ago = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    _, compliance_pct = _compute_compliance(
+        sb, team_ids, players, two_weeks_ago, now_iso
+    )
 
     return [
-        StatCard(label="Active Players", value=round(total_players * 0.82), subtext=f"of {total_players} total", color="blue"),
-        StatCard(label="Assigned This Week", value=12, subtext="across all teams", color="blue"),
-        StatCard(label="Compliance Rate", value="78%", subtext="+4% from last week", trend="up", color="green"),
-        StatCard(label="Flagged Sessions", value=3, subtext="need form review", color="red"),
+        StatCard(
+            label="Active Players",
+            value=active_players,
+            subtext=f"of {total_players} total",
+            color="blue",
+        ),
+        StatCard(
+            label="Assigned This Week",
+            value=assigned_this_week,
+            subtext="across all teams",
+            color="blue",
+        ),
+        StatCard(
+            label="Compliance Rate",
+            value=f"{compliance_pct}%",
+            subtext="last 14 days",
+            color="green" if compliance_pct >= 70 else "yellow" if compliance_pct >= 50 else "red",
+        ),
+        StatCard(
+            label="Flagged Sessions",
+            value=flagged_count,
+            subtext="need form review" if flagged_count else "last 7 days",
+            color="red" if flagged_count else "blue",
+        ),
     ]
 
 
 @router.get("/coach/team-overviews", response_model=List[TeamOverview])
 def coach_team_overviews(user_id: str = Depends(get_current_user)):
     sb = _require_db()
-    resp = sb.table("teams").select("*").eq("coach_id", user_id).execute()
+    teams, team_ids, players = _get_coach_context(sb, user_id)
+
+    if not team_ids:
+        return []
+
+    pbt = _players_by_team(players)
+    monday, next_monday = _week_bounds()
+    two_weeks_ago = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+
+    # Assignments due this week per team
+    week_assignments = (
+        sb.table("workout_assignments")
+        .select("id, team_id")
+        .in_("team_id", team_ids)
+        .gte("due_at", monday)
+        .lt("due_at", next_monday)
+        .execute()
+        .data
+    )
+    workouts_per_team: Dict[str, int] = {}
+    for a in week_assignments:
+        workouts_per_team[a["team_id"]] = workouts_per_team.get(a["team_id"], 0) + 1
+
+    # Flagged VBT sets per team (last 7 days, via player -> team mapping)
+    player_team = {p["id"]: p["team_id"] for p in players}
+    player_ids = [p["id"] for p in players]
+    flagged_per_team: Dict[str, int] = {}
+    if player_ids:
+        flagged_rows = (
+            sb.table("vbt_set_summaries")
+            .select("player_id")
+            .in_("player_id", player_ids)
+            .eq("flagged", True)
+            .gte("created_at", week_ago)
+            .execute()
+            .data
+        )
+        for row in flagged_rows:
+            tid = player_team.get(row["player_id"])
+            if tid:
+                flagged_per_team[tid] = flagged_per_team.get(tid, 0) + 1
+
+    # Compliance per team (last 14 days)
+    compliance_per_team, _ = _compute_compliance(
+        sb, team_ids, players, two_weeks_ago, now_iso
+    )
 
     return [
         TeamOverview(
             id=t["id"],
             name=t["name"],
             sport=t["sport"],
-            playerCount=30,
-            activeCount=24,
-            compliancePercent=round(60 + random.random() * 35),
-            needsAttention=random.randint(0, 5),
-            workoutsThisWeek=random.randint(2, 5),
+            playerCount=len(pbt.get(t["id"], [])),
+            activeCount=sum(
+                1 for p in pbt.get(t["id"], []) if p.get("linked_user_id")
+            ),
+            workoutsThisWeek=workouts_per_team.get(t["id"], 0),
+            compliancePercent=compliance_per_team.get(t["id"], 0),
+            needsAttention=flagged_per_team.get(t["id"], 0),
         )
-        for t in resp.data
+        for t in teams
     ]
 
 
 @router.get("/coach/activity-feed", response_model=List[ActivityItem])
 def coach_activity_feed(user_id: str = Depends(get_current_user)):
-    now = datetime.now(timezone.utc)
-    hour = timedelta(hours=1)
+    sb = _require_db()
+    _, team_ids, players = _get_coach_context(sb, user_id)
 
-    return [
-        ActivityItem(id="1", playerName="Marcus Williams", exercise="Back Squat", details="5x5 @ 275 lbs — avg velocity 0.68 m/s", timestamp=(now - hour * 1).isoformat(), flagged=False),
-        ActivityItem(id="2", playerName="Jaylen Carter", exercise="Power Clean", details="4x3 @ 205 lbs — avg velocity 1.05 m/s", timestamp=(now - hour * 2).isoformat(), flagged=True, flagReason="Unusual bar path detected on sets 2-3"),
-        ActivityItem(id="3", playerName="Chris Johnson", exercise="Bench Press", details="4x6 @ 195 lbs — avg velocity 0.52 m/s", timestamp=(now - hour * 3.5).isoformat(), flagged=False),
-        ActivityItem(id="4", playerName="Devon Mitchell", exercise="Hang Clean", details="5x3 @ 185 lbs — avg velocity 1.12 m/s", timestamp=(now - hour * 5).isoformat(), flagged=False),
-        ActivityItem(id="5", playerName="Tyler Brooks", exercise="Front Squat", details="4x4 @ 225 lbs — avg velocity 0.61 m/s", timestamp=(now - hour * 6).isoformat(), flagged=True, flagReason="Excessive forward lean on reps 3-4"),
-        ActivityItem(id="6", playerName="Andre Davis", exercise="Back Squat", details="5x5 @ 315 lbs — avg velocity 0.55 m/s", timestamp=(now - hour * 8).isoformat(), flagged=False),
-        ActivityItem(id="7", playerName="Isaiah Thompson", exercise="Bench Press", details="5x5 @ 225 lbs — avg velocity 0.48 m/s", timestamp=(now - hour * 10).isoformat(), flagged=False),
-    ]
+    if not team_ids:
+        return []
+
+    player_ids = [p["id"] for p in players]
+    if not player_ids:
+        return []
+
+    player_names = {
+        p["id"]: f'{p.get("first_name", "")} {p.get("last_name", "")}'.strip()
+        for p in players
+    }
+
+    items: List[ActivityItem] = []
+
+    # VBT activity (most recent 15)
+    vbt_rows = (
+        sb.table("vbt_set_summaries")
+        .select(
+            "id, player_id, exercise, rep_count, avg_velocity, "
+            "peak_velocity, flagged, flag_reason, created_at"
+        )
+        .in_("player_id", player_ids)
+        .order("created_at", desc=True)
+        .limit(15)
+        .execute()
+        .data
+    )
+    for row in vbt_rows:
+        items.append(
+            ActivityItem(
+                id=f"vbt-{row['id']}",
+                playerName=player_names.get(row["player_id"], "Unknown"),
+                exercise=row["exercise"],
+                details=(
+                    f"{row['rep_count']} reps @ {float(row['avg_velocity']):.2f} m/s avg, "
+                    f"{float(row['peak_velocity']):.2f} m/s peak"
+                ),
+                timestamp=row["created_at"],
+                flagged=row.get("flagged", False),
+                flagReason=row.get("flag_reason"),
+            )
+        )
+
+    # Self-report activity (most recent 15) — graceful if table missing
+    try:
+        log_rows = (
+            sb.table("workout_exercise_logs")
+            .select(
+                "id, player_id, exercise_name, weight_lbs, "
+                "sets_completed, reps_per_set, logged_at"
+            )
+            .in_("player_id", player_ids)
+            .order("logged_at", desc=True)
+            .limit(15)
+            .execute()
+            .data
+        )
+        for row in log_rows:
+            weight = row.get("weight_lbs")
+            weight_str = f" @ {int(weight)} lbs" if weight else ""
+            reps = row.get("reps_per_set")
+            reps_str = f" \u00d7 {reps} reps" if reps else ""
+            items.append(
+                ActivityItem(
+                    id=f"log-{row['id']}",
+                    playerName=player_names.get(row["player_id"], "Unknown"),
+                    exercise=row["exercise_name"],
+                    details=f"{row['sets_completed']} sets{reps_str}{weight_str} (self-report)",
+                    timestamp=row["logged_at"],
+                    flagged=False,
+                )
+            )
+    except Exception:
+        logger.debug("workout_exercise_logs not available, skipping self-report items")
+
+    # Merge by timestamp descending, take top 20
+    items.sort(key=lambda x: x.timestamp, reverse=True)
+    return items[:20]
 
 
 @router.get("/coach/due-workouts", response_model=List[DueWorkout])
 def coach_due_workouts(user_id: str = Depends(get_current_user)):
-    now = datetime.now(timezone.utc)
-    day = timedelta(days=1)
+    sb = _require_db()
+    teams, team_ids, players = _get_coach_context(sb, user_id)
 
-    return [
-        DueWorkout(id="1", templateName="Week 6 — Heavy Squat Day", teamName="Varsity Football", targetLabel="Entire Team", dueAt=(now + day * 2).isoformat(), completedCount=18, totalCount=30, overdue=False),
-        DueWorkout(id="2", templateName="Upper Body Hypertrophy", teamName="Varsity Football", targetLabel="Skill Position", dueAt=(now + day * 1).isoformat(), completedCount=4, totalCount=12, overdue=False),
-        DueWorkout(id="3", templateName="Week 5 — Power Clean Complex", teamName="Varsity Football", targetLabel="Power Position", dueAt=(now - day * 1).isoformat(), completedCount=8, totalCount=14, overdue=True),
-        DueWorkout(id="4", templateName="Accessory Work — Week 6", teamName="Varsity Football", targetLabel="Entire Team", dueAt=(now + day * 4).isoformat(), completedCount=0, totalCount=30, overdue=False),
-    ]
+    if not team_ids:
+        return []
+
+    now = datetime.now(timezone.utc)
+    week_ago_iso = (now - timedelta(days=7)).isoformat()
+    two_weeks_ahead_iso = (now + timedelta(days=14)).isoformat()
+    now_iso = now.isoformat()
+
+    pbt = _players_by_team(players)
+    team_names = {t["id"]: t["name"] for t in teams}
+
+    # Assignments: overdue (last 7 days) + upcoming (next 14 days)
+    assignments = (
+        sb.table("workout_assignments")
+        .select(
+            "id, team_id, template_id, target_type, target_position_group, "
+            "due_at, start_at, workout_templates(name)"
+        )
+        .in_("team_id", team_ids)
+        .gte("due_at", week_ago_iso)
+        .lte("due_at", two_weeks_ahead_iso)
+        .order("due_at")
+        .execute()
+        .data
+    )
+
+    if not assignments:
+        return []
+
+    assignment_ids = [a["id"] for a in assignments]
+    junction_map = _fetch_junction_map(sb, assignments)
+
+    # Completion from workout_exercise_logs
+    log_started: Dict[str, set] = {}  # assignment_id -> {player_ids}
+    try:
+        for row in (
+            sb.table("workout_exercise_logs")
+            .select("assignment_id, player_id")
+            .in_("assignment_id", assignment_ids)
+            .execute()
+            .data
+        ):
+            log_started.setdefault(row["assignment_id"], set()).add(row["player_id"])
+    except Exception:
+        pass
+
+    # Completion from VBT activity
+    player_ids = [p["id"] for p in players]
+    vbt_rows: list = []
+    if player_ids:
+        vbt_rows = (
+            sb.table("vbt_set_summaries")
+            .select("player_id, created_at")
+            .in_("player_id", player_ids)
+            .gte("created_at", week_ago_iso)
+            .lte("created_at", two_weeks_ahead_iso)
+            .execute()
+            .data
+        )
+
+    target_labels = {"team": "Entire Team", "players": "Selected Players"}
+
+    results: List[DueWorkout] = []
+    for a in assignments:
+        eligible = _eligible_player_ids(a, pbt, junction_map)
+
+        # Players who started (logs + VBT in the assignment window)
+        started = log_started.get(a["id"], set()) & eligible
+        a_start = a.get("start_at") or week_ago_iso
+        a_due = a.get("due_at") or two_weeks_ahead_iso
+        for v in vbt_rows:
+            if v["player_id"] in eligible and a_start <= v["created_at"] <= a_due:
+                started.add(v["player_id"])
+
+        template = a.get("workout_templates")
+        template_name = (
+            template["name"]
+            if isinstance(template, dict) and template
+            else "Unnamed Workout"
+        )
+
+        target_type = a.get("target_type", "team")
+        if target_type == "position_group":
+            label = (a.get("target_position_group") or "Unknown").capitalize()
+        else:
+            label = target_labels.get(target_type, "Entire Team")
+
+        results.append(
+            DueWorkout(
+                id=a["id"],
+                templateName=template_name,
+                teamName=team_names.get(a["team_id"], "Unknown Team"),
+                targetLabel=label,
+                dueAt=a.get("due_at", ""),
+                completedCount=len(started),
+                totalCount=len(eligible),
+                overdue=bool(a.get("due_at") and a["due_at"] < now_iso),
+            )
+        )
+
+    return results
 
 
 # ─── Team Dashboard ─────────────────────────────────────────────────────────
