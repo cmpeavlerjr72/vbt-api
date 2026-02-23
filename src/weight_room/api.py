@@ -12,6 +12,7 @@ from weight_room.routers import (
     players,
     profiles,
     rfid,
+    team_coaches,
     teams,
     testing,
     vbt,
@@ -32,6 +33,7 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 app.include_router(profiles.router)
 app.include_router(teams.router)
+app.include_router(team_coaches.router)
 app.include_router(players.router)
 app.include_router(maxes.router)
 app.include_router(testing.router)

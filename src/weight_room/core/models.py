@@ -20,12 +20,29 @@ class ProfileOut(BaseModel):
     email: Optional[str] = None
     display_name: Optional[str] = None
     role: str = "coach"
+    coach_code: Optional[str] = None
     created_at: str
 
 
 class ProfileUpdate(BaseModel):
     display_name: Optional[str] = None
     role: Optional[str] = None
+
+
+# ── Team Coaches ────────────────────────────────────────────────────────────
+
+class TeamCoachOut(BaseModel):
+    id: str
+    team_id: str
+    coach_id: str
+    role: str
+    display_name: Optional[str] = None
+    email: Optional[str] = None
+    added_at: str
+
+
+class AddTeamCoachRequest(BaseModel):
+    coach_code: str
 
 
 # ── Teams ────────────────────────────────────────────────────────────────────

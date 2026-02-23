@@ -6,6 +6,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from weight_room.auth import get_current_user
+from weight_room.core.access import require_team_access
 from weight_room.core.models import VbtLeaderboardSetOut, VbtRepOut, VbtSetSummaryOut
 from weight_room.db import get_supabase
 
@@ -75,6 +76,7 @@ def team_set_summaries(
     user_id: str = Depends(get_current_user),
 ):
     sb = _require_db()
+    require_team_access(sb, team_id, user_id)
     resp = (
         sb.table("vbt_set_summaries")
         .select("*, vbt_raw_sets!inner(team_id)")
@@ -98,6 +100,7 @@ def team_leaderboard_sets(
     user_id: str = Depends(get_current_user),
 ):
     sb = _require_db()
+    require_team_access(sb, team_id, user_id)
 
     # 1. Fetch set summaries for this team
     sum_resp = (
@@ -167,6 +170,7 @@ def team_flagged_reps(
     user_id: str = Depends(get_current_user),
 ):
     sb = _require_db()
+    require_team_access(sb, team_id, user_id)
     resp = (
         sb.table("vbt_reps")
         .select("*, vbt_raw_sets!inner(team_id)")

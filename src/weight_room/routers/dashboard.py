@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from weight_room.auth import get_current_user
+from weight_room.core.access import get_all_accessible_teams, require_team_access
 from weight_room.core.models import (
     ActivityItem,
     DueWorkout,
@@ -46,11 +47,8 @@ def _require_db():
 # ─── Shared helpers ──────────────────────────────────────────────────────────
 
 def _get_coach_context(sb, user_id: str, *, include_archived: bool = False):
-    """Fetch teams, team_ids, and players for a coach."""
-    q = sb.table("teams").select("*").eq("coach_id", user_id)
-    if not include_archived:
-        q = q.eq("archived", False)
-    teams = q.execute().data
+    """Fetch teams, team_ids, and players for a coach (includes assistant teams)."""
+    teams = get_all_accessible_teams(sb, user_id, include_archived=include_archived)
     team_ids = [t["id"] for t in teams]
     players: list = []
     if team_ids:
@@ -601,19 +599,7 @@ def coach_due_workouts(user_id: str = Depends(get_current_user)):
 @router.get("/teams/{team_id}/overview", response_model=TeamOverviewDetail)
 def team_overview(team_id: str, user_id: str = Depends(get_current_user)):
     sb = _require_db()
-
-    # Verify ownership
-    team_rows = (
-        sb.table("teams")
-        .select("*")
-        .eq("id", team_id)
-        .eq("coach_id", user_id)
-        .execute()
-        .data
-    )
-    if not team_rows:
-        raise HTTPException(status_code=404, detail="Team not found")
-    team = team_rows[0]
+    team = require_team_access(sb, team_id, user_id)
 
     # Fetch players for this team
     players = (

@@ -6,6 +6,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException
 
 from weight_room.auth import get_current_user
+from weight_room.core.access import require_team_access
 from weight_room.core.models import (
     ActiveWorkout,
     ExerciseProgress,
@@ -94,6 +95,7 @@ def delete_template(template_id: str, user_id: str = Depends(get_current_user)):
 @router.get("/teams/{team_id}/assignments", response_model=List[WorkoutAssignmentOut])
 def list_team_assignments(team_id: str, user_id: str = Depends(get_current_user)):
     sb = _require_db()
+    require_team_access(sb, team_id, user_id)
     resp = (
         sb.table("workout_assignments")
         .select("*")
@@ -107,6 +109,7 @@ def list_team_assignments(team_id: str, user_id: str = Depends(get_current_user)
 @router.post("/assignments", response_model=WorkoutAssignmentOut, status_code=201)
 def create_assignment(body: WorkoutAssignmentCreate, user_id: str = Depends(get_current_user)):
     sb = _require_db()
+    require_team_access(sb, body.team_id, user_id)
     row = {
         "team_id": body.team_id,
         "template_id": body.template_id,

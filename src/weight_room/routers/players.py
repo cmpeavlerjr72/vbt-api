@@ -6,6 +6,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 
 from weight_room.auth import get_current_user
+from weight_room.core.access import require_team_access
 from weight_room.core.models import ClaimInviteRequest, PlayerCreate, PlayerMeOut, PlayerOut, PlayerUpdate
 from weight_room.db import get_supabase
 
@@ -22,6 +23,7 @@ def _require_db():
 @router.get("/teams/{team_id}/players", response_model=List[PlayerOut])
 def list_team_players(team_id: str, user_id: str = Depends(get_current_user)):
     sb = _require_db()
+    require_team_access(sb, team_id, user_id)
     resp = (
         sb.table("players")
         .select("*")
@@ -35,6 +37,7 @@ def list_team_players(team_id: str, user_id: str = Depends(get_current_user)):
 @router.post("/teams/{team_id}/players", response_model=PlayerOut, status_code=201)
 def create_player(team_id: str, body: PlayerCreate, user_id: str = Depends(get_current_user)):
     sb = _require_db()
+    require_team_access(sb, team_id, user_id)
     resp = (
         sb.table("players")
         .insert({

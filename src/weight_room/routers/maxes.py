@@ -7,6 +7,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from weight_room.auth import get_current_user
+from weight_room.core.access import require_team_access
 from weight_room.core.models import PlayerMaxHistoryOut, PlayerMaxOut, PlayerMaxUpsert
 from weight_room.db import get_supabase
 
@@ -94,6 +95,7 @@ def list_player_max_history(
 @router.get("/teams/{team_id}/maxes", response_model=List[PlayerMaxOut])
 def list_team_maxes(team_id: str, user_id: str = Depends(get_current_user)):
     sb = _require_db()
+    require_team_access(sb, team_id, user_id)
     resp = (
         sb.table("player_maxes")
         .select("*, players!inner(team_id)")

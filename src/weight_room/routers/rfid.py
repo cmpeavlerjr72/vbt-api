@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from weight_room.auth import get_current_user
+from weight_room.core.access import require_team_access
 from weight_room.core.models import RfidTagAssign, RfidTagCreate, RfidTagOut, ScanEventCreate
 from weight_room.db import get_supabase
 
@@ -42,6 +43,7 @@ def lookup_rfid_tag(uid: str = Query(...), user_id: str = Depends(get_current_us
 @router.post("/rfid/tags", response_model=RfidTagOut, status_code=201)
 def create_rfid_tag(body: RfidTagCreate, user_id: str = Depends(get_current_user)):
     sb = _require_db()
+    require_team_access(sb, body.team_id, user_id)
     try:
         resp = (
             sb.table("rfid_tags")
