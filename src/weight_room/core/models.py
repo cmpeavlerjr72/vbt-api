@@ -322,6 +322,12 @@ class ActivityItem(BaseModel):
     flagReason: Optional[str] = None
 
 
+class TeamOverviewDetail(BaseModel):
+    team: TeamOverview
+    stats: List[StatCard]
+    activity: List[ActivityItem]
+
+
 class DueWorkout(BaseModel):
     id: str
     templateName: str

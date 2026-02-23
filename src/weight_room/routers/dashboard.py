@@ -21,6 +21,7 @@ from weight_room.core.models import (
     PositionComparison,
     StatCard,
     TeamOverview,
+    TeamOverviewDetail,
     TodayWorkout,
     TodayExercise,
     TodaySetGroup,
@@ -431,26 +432,16 @@ def coach_team_overviews(
     ]
 
 
-@router.get("/coach/activity-feed", response_model=List[ActivityItem])
-def coach_activity_feed(user_id: str = Depends(get_current_user)):
-    sb = _require_db()
-    _, team_ids, players = _get_coach_context(sb, user_id)
-
-    if not team_ids:
-        return []
-
-    player_ids = [p["id"] for p in players]
+def _build_activity_feed(
+    sb, player_ids: list, player_names: dict, limit: int = 15
+) -> List[ActivityItem]:
+    """Build activity feed from VBT + self-report data for given players."""
     if not player_ids:
         return []
 
-    player_names = {
-        p["id"]: f'{p.get("first_name", "")} {p.get("last_name", "")}'.strip()
-        for p in players
-    }
-
     items: List[ActivityItem] = []
 
-    # VBT activity (most recent 15)
+    # VBT activity (most recent)
     vbt_rows = (
         sb.table("vbt_set_summaries")
         .select(
@@ -459,7 +450,7 @@ def coach_activity_feed(user_id: str = Depends(get_current_user)):
         )
         .in_("player_id", player_ids)
         .order("created_at", desc=True)
-        .limit(15)
+        .limit(limit)
         .execute()
         .data
     )
@@ -479,7 +470,7 @@ def coach_activity_feed(user_id: str = Depends(get_current_user)):
             )
         )
 
-    # Self-report activity (most recent 15) — graceful if table missing
+    # Self-report activity — graceful if table missing
     try:
         log_rows = (
             sb.table("workout_exercise_logs")
@@ -489,7 +480,7 @@ def coach_activity_feed(user_id: str = Depends(get_current_user)):
             )
             .in_("player_id", player_ids)
             .order("logged_at", desc=True)
-            .limit(15)
+            .limit(limit)
             .execute()
             .data
         )
@@ -511,9 +502,26 @@ def coach_activity_feed(user_id: str = Depends(get_current_user)):
     except Exception:
         logger.debug("workout_exercise_logs not available, skipping self-report items")
 
-    # Merge by timestamp descending, take top 20
+    # Merge by timestamp descending
     items.sort(key=lambda x: x.timestamp, reverse=True)
-    return items[:20]
+    return items[:limit + 5]  # return slightly more than limit for merged feeds
+
+
+@router.get("/coach/activity-feed", response_model=List[ActivityItem])
+def coach_activity_feed(user_id: str = Depends(get_current_user)):
+    sb = _require_db()
+    _, team_ids, players = _get_coach_context(sb, user_id)
+
+    if not team_ids:
+        return []
+
+    player_ids = [p["id"] for p in players]
+    player_names = {
+        p["id"]: f'{p.get("first_name", "")} {p.get("last_name", "")}'.strip()
+        for p in players
+    }
+
+    return _build_activity_feed(sb, player_ids, player_names, limit=15)[:20]
 
 
 @router.get("/coach/due-workouts", response_model=List[DueWorkout])
@@ -588,6 +596,135 @@ def coach_due_workouts(user_id: str = Depends(get_current_user)):
         )
 
     return results
+
+
+@router.get("/teams/{team_id}/overview", response_model=TeamOverviewDetail)
+def team_overview(team_id: str, user_id: str = Depends(get_current_user)):
+    sb = _require_db()
+
+    # Verify ownership
+    team_rows = (
+        sb.table("teams")
+        .select("*")
+        .eq("id", team_id)
+        .eq("coach_id", user_id)
+        .execute()
+        .data
+    )
+    if not team_rows:
+        raise HTTPException(status_code=404, detail="Team not found")
+    team = team_rows[0]
+
+    # Fetch players for this team
+    players = (
+        sb.table("players").select("*").eq("team_id", team_id).execute().data
+    )
+    player_ids = [p["id"] for p in players]
+    player_names = {
+        p["id"]: f'{p.get("first_name", "")} {p.get("last_name", "")}'.strip()
+        for p in players
+    }
+
+    total_players = len(players)
+    active_players = sum(1 for p in players if p.get("linked_user_id"))
+
+    now = datetime.now(timezone.utc)
+    monday, _ = _week_bounds()
+    week_ago = (now - timedelta(days=7)).isoformat()
+    two_weeks_ago = (now - timedelta(days=14)).isoformat()
+    now_iso = now.isoformat()
+
+    # Assignments created this week for this team
+    assigned_this_week = len(
+        sb.table("workout_assignments")
+        .select("id")
+        .eq("team_id", team_id)
+        .gte("created_at", monday)
+        .execute()
+        .data
+    )
+
+    # Compliance (last 14 days)
+    per_team, _ = _compute_compliance(
+        sb, [team_id], players, two_weeks_ago, now_iso
+    )
+    compliance_pct = per_team.get(team_id, 0)
+
+    # Flagged VBT sets (last 7 days)
+    flagged_count = 0
+    if player_ids:
+        flagged_count = len(
+            sb.table("vbt_set_summaries")
+            .select("id")
+            .in_("player_id", player_ids)
+            .eq("flagged", True)
+            .gte("created_at", week_ago)
+            .execute()
+            .data
+        )
+
+    # Workouts due this week
+    next_monday = (
+        now.replace(hour=0, minute=0, second=0, microsecond=0)
+        - timedelta(days=now.weekday())
+        + timedelta(days=7)
+    ).isoformat()
+    workouts_this_week = len(
+        sb.table("workout_assignments")
+        .select("id")
+        .eq("team_id", team_id)
+        .gte("due_at", monday)
+        .lt("due_at", next_monday)
+        .execute()
+        .data
+    )
+
+    stats = [
+        StatCard(
+            label="Active Players",
+            value=active_players,
+            subtext=f"of {total_players} total",
+            color="blue",
+        ),
+        StatCard(
+            label="Assigned This Week",
+            value=assigned_this_week,
+            subtext="this team",
+            color="blue",
+        ),
+        StatCard(
+            label="Compliance Rate",
+            value=f"{compliance_pct}%",
+            subtext="last 14 days",
+            color="green" if compliance_pct >= 70 else "yellow" if compliance_pct >= 50 else "red",
+        ),
+        StatCard(
+            label="Flagged Sessions",
+            value=flagged_count,
+            subtext="need form review" if flagged_count else "last 7 days",
+            color="red" if flagged_count else "blue",
+        ),
+    ]
+
+    activity = _build_activity_feed(sb, player_ids, player_names, limit=15)[:15]
+
+    team_overview_obj = TeamOverview(
+        id=team["id"],
+        name=team["name"],
+        sport=team["sport"],
+        playerCount=total_players,
+        activeCount=active_players,
+        workoutsThisWeek=workouts_this_week,
+        compliancePercent=compliance_pct,
+        needsAttention=flagged_count,
+        archived=team.get("archived", False),
+    )
+
+    return TeamOverviewDetail(
+        team=team_overview_obj,
+        stats=stats,
+        activity=activity,
+    )
 
 
 # ─── Team Dashboard ─────────────────────────────────────────────────────────
