@@ -25,26 +25,26 @@ def list_team_coaches(team_id: str, user_id: str = Depends(get_current_user)):
     sb = _require_db()
     require_team_access(sb, team_id, user_id)
 
-    rows = (
+    _resp = (
         sb.table("team_coaches")
         .select("id, team_id, coach_id, role, added_at")
         .eq("team_id", team_id)
         .order("added_at")
         .execute()
-        .data
     )
+    rows = _resp.data if _resp else []
 
     # Enrich with profile info
     coach_ids = [r["coach_id"] for r in rows]
     profiles = {}
     if coach_ids:
-        p_rows = (
+        _p_resp = (
             sb.table("profiles")
             .select("id, display_name, email")
             .in_("id", coach_ids)
             .execute()
-            .data
         )
+        p_rows = _p_resp.data if _p_resp else []
         profiles = {p["id"]: p for p in p_rows}
 
     result = []
@@ -75,7 +75,7 @@ def add_team_coach(
         .maybe_single()
         .execute()
     )
-    if not profile.data:
+    if not profile or not profile.data:
         raise HTTPException(status_code=404, detail="No coach found with that code")
 
     target_id = profile.data["id"]
@@ -91,7 +91,7 @@ def add_team_coach(
         .maybe_single()
         .execute()
     )
-    if existing.data:
+    if existing and existing.data:
         raise HTTPException(status_code=409, detail="Coach is already on this team")
 
     resp = (
@@ -99,6 +99,8 @@ def add_team_coach(
         .insert({"team_id": team_id, "coach_id": target_id, "role": "assistant"})
         .execute()
     )
+    if not resp or not resp.data:
+        raise HTTPException(status_code=500, detail="Failed to add coach")
     row = resp.data[0]
     return {
         **row,

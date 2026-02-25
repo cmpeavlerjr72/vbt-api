@@ -35,7 +35,7 @@ def player_set_summaries(
         .limit(limit)
         .execute()
     )
-    return resp.data
+    return resp.data if resp else []
 
 
 @router.get("/vbt/sets/{raw_set_id}/reps", response_model=List[VbtRepOut])
@@ -48,7 +48,7 @@ def set_reps(raw_set_id: str, user_id: str = Depends(get_current_user)):
         .order("rep_number")
         .execute()
     )
-    return resp.data
+    return resp.data if resp else []
 
 
 @router.get("/players/{player_id}/vbt/recent-reps", response_model=List[VbtRepOut])
@@ -66,7 +66,7 @@ def player_recent_reps(
         .limit(limit)
         .execute()
     )
-    return resp.data
+    return resp.data if resp else []
 
 
 @router.get("/teams/{team_id}/vbt/set-summaries", response_model=List[VbtSetSummaryOut])
@@ -87,7 +87,7 @@ def team_set_summaries(
     )
     # Strip join data
     rows = []
-    for row in resp.data:
+    for row in (resp.data if resp else []):
         row.pop("vbt_raw_sets", None)
         rows.append(row)
     return rows
@@ -113,7 +113,7 @@ def team_leaderboard_sets(
     )
     summaries = []
     raw_set_ids = set()
-    for row in sum_resp.data:
+    for row in (sum_resp.data if sum_resp else []):
         row.pop("vbt_raw_sets", None)
         summaries.append(row)
         raw_set_ids.add(row["raw_set_id"])
@@ -131,7 +131,7 @@ def team_leaderboard_sets(
 
     # 3. Compute per-set averages
     accel_sums: dict[str, dict] = {}
-    for rep in rep_resp.data:
+    for rep in (rep_resp.data if rep_resp else []):
         sid = rep["raw_set_id"]
         if sid not in accel_sums:
             accel_sums[sid] = {
@@ -181,7 +181,7 @@ def team_flagged_reps(
         .execute()
     )
     rows = []
-    for row in resp.data:
+    for row in (resp.data if resp else []):
         row.pop("vbt_raw_sets", None)
         rows.append(row)
     return rows
@@ -199,7 +199,7 @@ def player_prs(player_id: str, user_id: str = Depends(get_current_user)):
     )
     # Dedupe to best per exercise
     best: dict[str, dict] = {}
-    for rep in resp.data:
+    for rep in (resp.data if resp else []):
         ex = rep["exercise"]
         if ex not in best:
             best[ex] = rep
@@ -217,7 +217,7 @@ def delete_set(raw_set_id: str, user_id: str = Depends(get_current_user)):
         .eq("id", raw_set_id)
         .execute()
     )
-    if not set_resp.data:
+    if not set_resp or not set_resp.data:
         raise HTTPException(status_code=404, detail="Set not found")
 
     team_id = set_resp.data[0]["team_id"]
@@ -227,7 +227,7 @@ def delete_set(raw_set_id: str, user_id: str = Depends(get_current_user)):
         .eq("id", team_id)
         .execute()
     )
-    if not team_resp.data or team_resp.data[0]["coach_id"] != user_id:
+    if not team_resp or not team_resp.data or team_resp.data[0]["coach_id"] != user_id:
         raise HTTPException(status_code=403, detail="Not authorized to delete this set")
 
     # Delete from vbt_raw_sets — CASCADE handles reps + summaries

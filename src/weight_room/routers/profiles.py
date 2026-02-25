@@ -21,7 +21,7 @@ def _require_db():
 def get_my_profile(user_id: str = Depends(get_current_user)):
     sb = _require_db()
     resp = sb.table("profiles").select("*").eq("id", user_id).maybe_single().execute()
-    if not resp.data:
+    if not resp or not resp.data:
         raise HTTPException(status_code=404, detail="Profile not found")
     return resp.data
 
@@ -33,6 +33,6 @@ def update_my_profile(body: ProfileUpdate, user_id: str = Depends(get_current_us
     if not patch:
         raise HTTPException(status_code=400, detail="No fields to update")
     resp = sb.table("profiles").update(patch).eq("id", user_id).execute()
-    if not resp.data:
+    if not resp or not resp.data:
         raise HTTPException(status_code=404, detail="Profile not found")
     return resp.data[0]

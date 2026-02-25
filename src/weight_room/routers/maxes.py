@@ -31,7 +31,7 @@ def list_player_maxes(player_id: str, user_id: str = Depends(get_current_user)):
         .order("exercise")
         .execute()
     )
-    return resp.data
+    return resp.data if resp else []
 
 
 @router.post("/players/{player_id}/maxes", response_model=PlayerMaxOut)
@@ -49,7 +49,7 @@ def upsert_player_max(
         .maybe_single()
         .execute()
     )
-    if existing.data:
+    if existing and existing.data:
         sb.table("player_max_history").insert({
             "player_id": existing.data["player_id"],
             "exercise": existing.data["exercise"],
@@ -71,6 +71,8 @@ def upsert_player_max(
         )
         .execute()
     )
+    if not resp or not resp.data:
+        raise HTTPException(status_code=500, detail="Failed to upsert max")
     return resp.data[0]
 
 
@@ -89,7 +91,7 @@ def list_player_max_history(
     if exercise:
         q = q.eq("exercise", exercise)
     resp = q.order("tested_at", desc=True).execute()
-    return resp.data
+    return resp.data if resp else []
 
 
 @router.get("/teams/{team_id}/maxes", response_model=List[PlayerMaxOut])
@@ -104,7 +106,7 @@ def list_team_maxes(team_id: str, user_id: str = Depends(get_current_user)):
     )
     # Strip the join data before returning
     rows = []
-    for row in resp.data:
+    for row in (resp.data if resp else []):
         row.pop("players", None)
         rows.append(row)
     return rows

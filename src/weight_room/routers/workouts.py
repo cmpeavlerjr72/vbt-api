@@ -42,7 +42,7 @@ def list_templates(user_id: str = Depends(get_current_user)):
         .order("created_at", desc=True)
         .execute()
     )
-    return resp.data
+    return resp.data if resp else []
 
 
 @router.post("/templates", response_model=WorkoutTemplateOut, status_code=201)
@@ -59,6 +59,8 @@ def create_template(body: WorkoutTemplateCreate, user_id: str = Depends(get_curr
         })
         .execute()
     )
+    if not resp or not resp.data:
+        raise HTTPException(status_code=500, detail="Failed to create template")
     return resp.data[0]
 
 
@@ -79,7 +81,7 @@ def update_template(
         .eq("coach_id", user_id)
         .execute()
     )
-    if not resp.data:
+    if not resp or not resp.data:
         raise HTTPException(status_code=404, detail="Template not found")
     return resp.data[0]
 
@@ -103,7 +105,7 @@ def list_team_assignments(team_id: str, user_id: str = Depends(get_current_user)
         .order("created_at", desc=True)
         .execute()
     )
-    return resp.data
+    return resp.data if resp else []
 
 
 @router.post("/assignments", response_model=WorkoutAssignmentOut, status_code=201)
@@ -125,6 +127,8 @@ def create_assignment(body: WorkoutAssignmentCreate, user_id: str = Depends(get_
         "created_by": user_id,
     }
     resp = sb.table("workout_assignments").insert(row).execute()
+    if not resp or not resp.data:
+        raise HTTPException(status_code=500, detail="Failed to create assignment")
     assignment = resp.data[0]
 
     # Insert junction rows for player-specific assignments
@@ -217,7 +221,7 @@ def _compute_exercise_progress(
                 window_end = due_at[:10] + "T23:59:59+00:00"
                 q = q.lte("created_at", window_end)
             resp = q.execute()
-            sets_done = resp.count if resp.count is not None else len(resp.data)
+            sets_done = resp.count if resp and resp.count is not None else len(resp.data if resp else [])
         else:
             # Self-report: fetch from workout_exercise_logs
             resp = (
@@ -255,7 +259,7 @@ def get_active_workouts(player_id: str, user_id: str = Depends(get_current_user)
 
     # Get player row
     player_resp = sb.table("players").select("*").eq("id", player_id).execute()
-    if not player_resp.data:
+    if not player_resp or not player_resp.data:
         raise HTTPException(status_code=404, detail="Player not found")
     player = player_resp.data[0]
 
@@ -270,7 +274,7 @@ def get_active_workouts(player_id: str, user_id: str = Depends(get_current_user)
     )
 
     results: list[ActiveWorkout] = []
-    for assignment in assign_resp.data:
+    for assignment in (assign_resp.data if assign_resp else []):
         # Filter by target
         target = assignment.get("target_type", "team")
         if target == "position_group":
@@ -365,7 +369,7 @@ def get_assignment_progress(
         .eq("id", assignment_id)
         .execute()
     )
-    if not assign_resp.data:
+    if not assign_resp or not assign_resp.data:
         raise HTTPException(status_code=404, detail="Assignment not found")
     assignment = assign_resp.data[0]
 
@@ -377,7 +381,7 @@ def get_assignment_progress(
         .eq("coach_id", user_id)
         .execute()
     )
-    if not team_resp.data:
+    if not team_resp or not team_resp.data:
         raise HTTPException(status_code=403, detail="Not your team")
 
     # Get template content
@@ -387,7 +391,7 @@ def get_assignment_progress(
         .eq("id", assignment["template_id"])
         .execute()
     )
-    if not tmpl_resp.data:
+    if not tmpl_resp or not tmpl_resp.data:
         raise HTTPException(status_code=404, detail="Template not found")
     parsed = _parse_exercises(tmpl_resp.data[0].get("content", {}))
 
@@ -405,10 +409,10 @@ def get_assignment_progress(
             .eq("assignment_id", assignment_id)
             .execute()
         )
-        eligible_ids = {r["player_id"] for r in junction_resp.data}
-        all_players = [p for p in players_resp.data if p["id"] in eligible_ids]
+        eligible_ids = {r["player_id"] for r in (junction_resp.data if junction_resp else [])}
+        all_players = [p for p in (players_resp.data if players_resp else []) if p["id"] in eligible_ids]
     else:
-        all_players = players_resp.data
+        all_players = players_resp.data if players_resp else []
 
     results: list[PlayerProgress] = []
     for player in all_players:

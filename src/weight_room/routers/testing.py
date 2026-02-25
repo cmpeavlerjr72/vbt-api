@@ -30,7 +30,7 @@ def list_player_testing(player_id: str, user_id: str = Depends(get_current_user)
         .order("metric_name")
         .execute()
     )
-    return resp.data
+    return resp.data if resp else []
 
 
 @router.post("/players/{player_id}/testing", response_model=PlayerTestingOut)
@@ -48,7 +48,7 @@ def upsert_player_testing(
         .maybe_single()
         .execute()
     )
-    if existing.data:
+    if existing and existing.data:
         sb.table("player_testing_history").insert({
             "player_id": existing.data["player_id"],
             "metric_name": existing.data["metric_name"],
@@ -72,6 +72,8 @@ def upsert_player_testing(
         )
         .execute()
     )
+    if not resp or not resp.data:
+        raise HTTPException(status_code=500, detail="Failed to upsert testing")
     return resp.data[0]
 
 
@@ -90,7 +92,7 @@ def list_player_testing_history(
     if metric:
         q = q.eq("metric_name", metric)
     resp = q.order("tested_at", desc=True).execute()
-    return resp.data
+    return resp.data if resp else []
 
 
 @router.get("/teams/{team_id}/testing", response_model=List[PlayerTestingOut])
@@ -103,7 +105,7 @@ def list_team_testing(team_id: str, user_id: str = Depends(get_current_user)):
         .execute()
     )
     rows = []
-    for row in resp.data:
+    for row in (resp.data if resp else []):
         row.pop("players", None)
         rows.append(row)
     return rows

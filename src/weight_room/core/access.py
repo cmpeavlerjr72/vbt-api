@@ -44,16 +44,17 @@ def get_all_accessible_teams(
     q = sb.table("teams").select("*").eq("coach_id", user_id)
     if not include_archived:
         q = q.eq("archived", False)
-    owned = q.execute().data
+    _owned_resp = q.execute()
+    owned = _owned_resp.data if _owned_resp else []
 
     # Teams where user is an assistant via team_coaches
-    tc_rows = (
+    _tc_resp = (
         sb.table("team_coaches")
         .select("team_id")
         .eq("coach_id", user_id)
         .execute()
-        .data
     )
+    tc_rows = _tc_resp.data if _tc_resp else []
     assistant_ids = [r["team_id"] for r in tc_rows]
     # Remove team IDs already in owned set
     owned_ids = {t["id"] for t in owned}
@@ -63,7 +64,8 @@ def get_all_accessible_teams(
         q2 = sb.table("teams").select("*").in_("id", extra_ids)
         if not include_archived:
             q2 = q2.eq("archived", False)
-        extra = q2.execute().data
+        _extra_resp = q2.execute()
+        extra = _extra_resp.data if _extra_resp else []
         owned.extend(extra)
 
     return owned

@@ -56,6 +56,8 @@ def create_set(body: DeviceSetIn):
             })
             .execute()
         )
+        if not raw_set_resp or not raw_set_resp.data:
+            raise HTTPException(status_code=500, detail="Failed to create raw set")
         raw_set = raw_set_resp.data[0]
         set_id = raw_set["id"]
 

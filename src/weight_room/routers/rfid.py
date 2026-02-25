@@ -53,6 +53,8 @@ def create_rfid_tag(body: RfidTagCreate, user_id: str = Depends(get_current_user
     except Exception as exc:
         log.exception("rfid tag create failed uid=%s team=%s", body.uid, body.team_id)
         raise HTTPException(status_code=500, detail=f"RFID tag creation failed: {exc}")
+    if not resp or not resp.data:
+        raise HTTPException(status_code=500, detail="Failed to create RFID tag")
     return resp.data[0]
 
 
@@ -69,7 +71,7 @@ def assign_rfid_tag(tag_id: str, body: RfidTagAssign, user_id: str = Depends(get
     except Exception as exc:
         log.exception("rfid assign failed tag=%s player=%s", tag_id, body.player_id)
         raise HTTPException(status_code=500, detail=f"RFID assign failed: {exc}")
-    if not resp.data:
+    if not resp or not resp.data:
         raise HTTPException(status_code=404, detail="Tag not found")
 
     # Update the player's rfid_tag_id

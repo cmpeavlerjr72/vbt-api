@@ -121,7 +121,7 @@ def get_my_team(user_id: str = Depends(get_current_user)):
 def get_player(player_id: str, user_id: str = Depends(get_current_user)):
     sb = _require_db()
     resp = sb.table("players").select("*").eq("id", player_id).maybe_single().execute()
-    if not resp.data:
+    if not resp or not resp.data:
         raise HTTPException(status_code=404, detail="Player not found")
     return resp.data
 
@@ -133,7 +133,7 @@ def update_player(player_id: str, body: PlayerUpdate, user_id: str = Depends(get
     if not patch:
         raise HTTPException(status_code=400, detail="No fields to update")
     resp = sb.table("players").update(patch).eq("id", player_id).execute()
-    if not resp.data:
+    if not resp or not resp.data:
         raise HTTPException(status_code=404, detail="Player not found")
     return resp.data[0]
 

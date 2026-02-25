@@ -52,7 +52,8 @@ def _get_coach_context(sb, user_id: str, *, include_archived: bool = False):
     team_ids = [t["id"] for t in teams]
     players: list = []
     if team_ids:
-        players = sb.table("players").select("*").in_("team_id", team_ids).execute().data
+        _p_resp = sb.table("players").select("*").in_("team_id", team_ids).execute()
+        players = _p_resp.data if _p_resp else []
     return teams, team_ids, players
 
 
@@ -121,13 +122,13 @@ def _fetch_junction_map(sb, assignments: list) -> Dict[str, set]:
     if not ids:
         return {}
     junction: Dict[str, set] = {}
-    for row in (
+    _junc_resp = (
         sb.table("workout_assignment_players")
         .select("assignment_id, player_id")
         .in_("assignment_id", ids)
         .execute()
-        .data
-    ):
+    )
+    for row in (_junc_resp.data if _junc_resp else []):
         junction.setdefault(row["assignment_id"], set()).add(row["player_id"])
     return junction
 
@@ -148,13 +149,13 @@ def _compute_set_completion(sb, assignments, players, junction_map, since_iso, u
     # Self-report logs: (assignment_id, player_id, exercise_name) -> sets_completed
     log_data: Dict[tuple, int] = {}
     try:
-        for row in (
+        _log_resp = (
             sb.table("workout_exercise_logs")
             .select("assignment_id, player_id, exercise_name, sets_completed")
             .in_("assignment_id", assignment_ids)
             .execute()
-            .data
-        ):
+        )
+        for row in (_log_resp.data if _log_resp else []):
             key = (row["assignment_id"], row["player_id"], row["exercise_name"])
             log_data[key] = row.get("sets_completed", 0)
     except Exception:
@@ -172,15 +173,15 @@ def _compute_set_completion(sb, assignments, players, junction_map, since_iso, u
         earliest = min(w[0] for w in all_windows)
         latest = max(w[1] for w in all_windows)
 
-        vbt_rows = (
+        _vbt_resp = (
             sb.table("vbt_set_summaries")
             .select("player_id, exercise, created_at")
             .in_("player_id", player_ids)
             .gte("created_at", earliest)
             .lte("created_at", latest)
             .execute()
-            .data
         )
+        vbt_rows = _vbt_resp.data if _vbt_resp else []
         for v in vbt_rows:
             vbt_index.setdefault((v["player_id"], v["exercise"]), []).append(
                 v["created_at"]
@@ -235,7 +236,7 @@ def _compute_compliance(sb, team_ids, players, since_iso, until_iso):
     if not team_ids:
         return {}, 0
 
-    assignments = (
+    _assign_resp = (
         sb.table("workout_assignments")
         .select(
             "id, team_id, target_type, target_position_group, "
@@ -245,8 +246,8 @@ def _compute_compliance(sb, team_ids, players, since_iso, until_iso):
         .gte("due_at", since_iso)
         .lte("due_at", until_iso)
         .execute()
-        .data
     )
+    assignments = _assign_resp.data if _assign_resp else []
     if not assignments:
         return {tid: 0 for tid in team_ids}, 0
 
@@ -296,29 +297,29 @@ def coach_stats(user_id: str = Depends(get_current_user)):
 
     # Assignments created this week
     monday, _ = _week_bounds()
-    assigned_this_week = len(
+    _aw_resp = (
         sb.table("workout_assignments")
         .select("id")
         .in_("team_id", team_ids)
         .gte("created_at", monday)
         .execute()
-        .data
     )
+    assigned_this_week = len(_aw_resp.data if _aw_resp else [])
 
     # Flagged VBT sets in last 7 days
     week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     player_ids = [p["id"] for p in players]
     flagged_count = 0
     if player_ids:
-        flagged_count = len(
+        _fc_resp = (
             sb.table("vbt_set_summaries")
             .select("id")
             .in_("player_id", player_ids)
             .eq("flagged", True)
             .gte("created_at", week_ago)
             .execute()
-            .data
         )
+        flagged_count = len(_fc_resp.data if _fc_resp else [])
 
     # Compliance (last 14 days)
     two_weeks_ago = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
@@ -375,15 +376,15 @@ def coach_team_overviews(
     week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
     # Assignments due this week per team
-    week_assignments = (
+    _wa_resp = (
         sb.table("workout_assignments")
         .select("id, team_id")
         .in_("team_id", team_ids)
         .gte("due_at", monday)
         .lt("due_at", next_monday)
         .execute()
-        .data
     )
+    week_assignments = _wa_resp.data if _wa_resp else []
     workouts_per_team: Dict[str, int] = {}
     for a in week_assignments:
         workouts_per_team[a["team_id"]] = workouts_per_team.get(a["team_id"], 0) + 1
@@ -393,15 +394,15 @@ def coach_team_overviews(
     player_ids = [p["id"] for p in players]
     flagged_per_team: Dict[str, int] = {}
     if player_ids:
-        flagged_rows = (
+        _fr_resp = (
             sb.table("vbt_set_summaries")
             .select("player_id")
             .in_("player_id", player_ids)
             .eq("flagged", True)
             .gte("created_at", week_ago)
             .execute()
-            .data
         )
+        flagged_rows = _fr_resp.data if _fr_resp else []
         for row in flagged_rows:
             tid = player_team.get(row["player_id"])
             if tid:
@@ -440,7 +441,7 @@ def _build_activity_feed(
     items: List[ActivityItem] = []
 
     # VBT activity (most recent)
-    vbt_rows = (
+    _vbt_feed_resp = (
         sb.table("vbt_set_summaries")
         .select(
             "id, player_id, exercise, rep_count, avg_velocity, "
@@ -450,8 +451,8 @@ def _build_activity_feed(
         .order("created_at", desc=True)
         .limit(limit)
         .execute()
-        .data
     )
+    vbt_rows = _vbt_feed_resp.data if _vbt_feed_resp else []
     for row in vbt_rows:
         items.append(
             ActivityItem(
@@ -470,7 +471,7 @@ def _build_activity_feed(
 
     # Self-report activity — graceful if table missing
     try:
-        log_rows = (
+        _log_feed_resp = (
             sb.table("workout_exercise_logs")
             .select(
                 "id, player_id, exercise_name, weight_lbs, "
@@ -480,8 +481,8 @@ def _build_activity_feed(
             .order("logged_at", desc=True)
             .limit(limit)
             .execute()
-            .data
         )
+        log_rows = _log_feed_resp.data if _log_feed_resp else []
         for row in log_rows:
             weight = row.get("weight_lbs")
             weight_str = f" @ {int(weight)} lbs" if weight else ""
@@ -539,7 +540,7 @@ def coach_due_workouts(user_id: str = Depends(get_current_user)):
     team_names = {t["id"]: t["name"] for t in teams}
 
     # Assignments: overdue (last 7 days) + upcoming (next 14 days)
-    assignments = (
+    _due_resp = (
         sb.table("workout_assignments")
         .select(
             "id, team_id, template_id, target_type, target_position_group, "
@@ -550,8 +551,8 @@ def coach_due_workouts(user_id: str = Depends(get_current_user)):
         .lte("due_at", two_weeks_ahead_iso)
         .order("due_at")
         .execute()
-        .data
     )
+    assignments = _due_resp.data if _due_resp else []
 
     if not assignments:
         return []
@@ -602,9 +603,8 @@ def team_overview(team_id: str, user_id: str = Depends(get_current_user)):
     team = require_team_access(sb, team_id, user_id)
 
     # Fetch players for this team
-    players = (
-        sb.table("players").select("*").eq("team_id", team_id).execute().data
-    )
+    _pl_resp = sb.table("players").select("*").eq("team_id", team_id).execute()
+    players = _pl_resp.data if _pl_resp else []
     player_ids = [p["id"] for p in players]
     player_names = {
         p["id"]: f'{p.get("first_name", "")} {p.get("last_name", "")}'.strip()
@@ -621,14 +621,14 @@ def team_overview(team_id: str, user_id: str = Depends(get_current_user)):
     now_iso = now.isoformat()
 
     # Assignments created this week for this team
-    assigned_this_week = len(
+    _atw_resp = (
         sb.table("workout_assignments")
         .select("id")
         .eq("team_id", team_id)
         .gte("created_at", monday)
         .execute()
-        .data
     )
+    assigned_this_week = len(_atw_resp.data if _atw_resp else [])
 
     # Compliance (last 14 days)
     per_team, _ = _compute_compliance(
@@ -639,15 +639,15 @@ def team_overview(team_id: str, user_id: str = Depends(get_current_user)):
     # Flagged VBT sets (last 7 days)
     flagged_count = 0
     if player_ids:
-        flagged_count = len(
+        _fc2_resp = (
             sb.table("vbt_set_summaries")
             .select("id")
             .in_("player_id", player_ids)
             .eq("flagged", True)
             .gte("created_at", week_ago)
             .execute()
-            .data
         )
+        flagged_count = len(_fc2_resp.data if _fc2_resp else [])
 
     # Workouts due this week
     next_monday = (
@@ -655,15 +655,15 @@ def team_overview(team_id: str, user_id: str = Depends(get_current_user)):
         - timedelta(days=now.weekday())
         + timedelta(days=7)
     ).isoformat()
-    workouts_this_week = len(
+    _wtw_resp = (
         sb.table("workout_assignments")
         .select("id")
         .eq("team_id", team_id)
         .gte("due_at", monday)
         .lt("due_at", next_monday)
         .execute()
-        .data
     )
+    workouts_this_week = len(_wtw_resp.data if _wtw_resp else [])
 
     stats = [
         StatCard(
@@ -754,7 +754,7 @@ def team_leaderboard(
         .execute()
     )
 
-    if not resp.data:
+    if not resp or not resp.data:
         return []
 
     # Find best set per player (highest value for selected metric)

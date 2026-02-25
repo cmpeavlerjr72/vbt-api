@@ -45,6 +45,8 @@ def create_team(body: TeamCreate, user_id: str = Depends(get_current_user)):
         .insert({"coach_id": user_id, "name": body.name, "sport": body.sport})
         .execute()
     )
+    if not resp or not resp.data:
+        raise HTTPException(status_code=500, detail="Failed to create team")
     team = resp.data[0]
     # Also insert into team_coaches as head coach
     sb.table("team_coaches").insert({
@@ -68,6 +70,6 @@ def update_team(team_id: str, body: TeamUpdate, user_id: str = Depends(get_curre
         .eq("id", team_id)
         .execute()
     )
-    if not resp.data:
+    if not resp or not resp.data:
         raise HTTPException(status_code=404, detail="Team not found")
     return resp.data[0]
