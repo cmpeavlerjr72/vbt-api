@@ -384,26 +384,6 @@ class TrendPoint(BaseModel):
     estimatedMax: float
 
 
-class TodaySetGroup(BaseModel):
-    sets: int
-    reps: int
-    targetWeight: Optional[float] = None
-    percentOfMax: Optional[float] = None
-    completedSets: int
-
-
-class TodayExercise(BaseModel):
-    name: str
-    setGroups: List[TodaySetGroup]
-    notes: Optional[str] = None
-
-
-class TodayWorkout(BaseModel):
-    id: str
-    name: str
-    dueAt: str
-    exercises: List[TodayExercise]
-
 
 class PositionComparison(BaseModel):
     exercise: str

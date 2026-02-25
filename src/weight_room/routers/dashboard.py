@@ -1,11 +1,8 @@
-"""Dashboard endpoints.
-
-Real coach dashboard data from DB queries.
-Team/player dashboards still return mock data.
-"""
+"""Dashboard endpoints — all backed by real DB queries."""
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
@@ -23,9 +20,6 @@ from weight_room.core.models import (
     StatCard,
     TeamOverview,
     TeamOverviewDetail,
-    TodayWorkout,
-    TodayExercise,
-    TodaySetGroup,
     TrendPoint,
     WorkoutSession,
 )
@@ -795,113 +789,283 @@ def team_leaderboard(
 
 @router.get("/teams/{team_id}/live-activity", response_model=List[LivePlayerActivity])
 def team_live_activity(team_id: str, user_id: str = Depends(get_current_user)):
-    now = datetime.now(timezone.utc)
-    return [
-        LivePlayerActivity(playerId="p2", playerName="Marcus Williams", jerseyNumber=54, positionGroup="Power", exercise="Back Squat", weight=275, avgVelocity=0.68, peakVelocity=0.78, repCount=4, totalReps=5, startedAt=(now - timedelta(seconds=120)).isoformat()),
-        LivePlayerActivity(playerId="p4", playerName="Jaylen Carter", jerseyNumber=7, positionGroup="Skill", exercise="Power Clean", weight=205, avgVelocity=1.05, peakVelocity=1.18, repCount=2, totalReps=3, startedAt=(now - timedelta(seconds=90)).isoformat()),
-        LivePlayerActivity(playerId="p3", playerName="Chris Johnson", jerseyNumber=11, positionGroup="Combo", exercise="Bench Press", weight=195, avgVelocity=0.52, peakVelocity=0.61, repCount=5, totalReps=6, startedAt=(now - timedelta(seconds=200)).isoformat()),
-        LivePlayerActivity(playerId="p5", playerName="Devon Mitchell", jerseyNumber=34, positionGroup="Power", exercise="Hang Clean", weight=185, avgVelocity=1.12, peakVelocity=1.25, repCount=3, totalReps=3, startedAt=(now - timedelta(seconds=60)).isoformat()),
-        LivePlayerActivity(playerId="p6", playerName="Tyler Brooks", jerseyNumber=88, positionGroup="Combo", exercise="Front Squat", weight=225, avgVelocity=0.61, peakVelocity=0.72, repCount=2, totalReps=5, startedAt=(now - timedelta(seconds=45)).isoformat()),
-        LivePlayerActivity(playerId="p8", playerName="Malik Robinson", jerseyNumber=45, positionGroup="Power", exercise="Back Squat", weight=295, avgVelocity=0.55, peakVelocity=0.65, repCount=3, totalReps=5, startedAt=(now - timedelta(seconds=180)).isoformat()),
-    ]
+    sb = _require_db()
+
+    five_min_ago = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+
+    # Recent raw sets with player info
+    resp = (
+        sb.table("vbt_raw_sets")
+        .select(
+            "id, player_id, exercise, created_at, "
+            "players!inner(first_name, last_name, jersey_number, position_group)"
+        )
+        .eq("team_id", team_id)
+        .gte("created_at", five_min_ago)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    raw_rows = resp.data if resp else []
+    if not raw_rows:
+        return []
+
+    # Dedupe to most recent set per player
+    seen_players: Dict[str, dict] = {}
+    for row in raw_rows:
+        pid = row["player_id"]
+        if pid not in seen_players:
+            seen_players[pid] = row
+
+    raw_set_ids = [row["id"] for row in seen_players.values()]
+
+    # Get set summaries for those raw sets
+    summary_resp = (
+        sb.table("vbt_set_summaries")
+        .select("raw_set_id, avg_velocity, peak_velocity, rep_count")
+        .in_("raw_set_id", raw_set_ids)
+        .execute()
+    )
+    summaries = {
+        s["raw_set_id"]: s for s in (summary_resp.data if summary_resp else [])
+    }
+
+    # Get player maxes for weights
+    player_ids = list(seen_players.keys())
+    maxes_resp = (
+        sb.table("player_maxes")
+        .select("player_id, exercise, weight")
+        .in_("player_id", player_ids)
+        .execute()
+    )
+    maxes: Dict[tuple, float] = {}
+    for m in (maxes_resp.data if maxes_resp else []):
+        maxes[(m["player_id"], m["exercise"])] = m["weight"]
+
+    results = []
+    for pid, row in seen_players.items():
+        player = row.get("players", {})
+        summary = summaries.get(row["id"], {})
+
+        results.append(LivePlayerActivity(
+            playerId=pid,
+            playerName=f'{player.get("first_name", "")} {player.get("last_name", "")}'.strip(),
+            jerseyNumber=player.get("jersey_number") or 0,
+            positionGroup=(player.get("position_group") or "skill").capitalize(),
+            exercise=row["exercise"],
+            weight=maxes.get((pid, row["exercise"]), 0),
+            avgVelocity=round(float(summary.get("avg_velocity", 0)), 2),
+            peakVelocity=round(float(summary.get("peak_velocity", 0)), 2),
+            repCount=summary.get("rep_count", 0),
+            totalReps=summary.get("rep_count", 0),
+            startedAt=row["created_at"],
+        ))
+
+    return results
 
 
 # ─── Player Dashboard ───────────────────────────────────────────────────────
 
-@router.get("/players/{player_id}/dashboard/today-workout", response_model=Optional[TodayWorkout])
-def player_today_workout(player_id: str, user_id: str = Depends(get_current_user)):
-    return TodayWorkout(
-        id="tw-1",
-        name="Week 6 — Heavy Squat Day",
-        dueAt=datetime.now(timezone.utc).isoformat(),
-        exercises=[
-            TodayExercise(name="Back Squat", setGroups=[
-                TodaySetGroup(sets=3, reps=5, targetWeight=250, percentOfMax=80, completedSets=3),
-                TodaySetGroup(sets=2, reps=3, targetWeight=285, percentOfMax=90, completedSets=0),
-            ]),
-            TodayExercise(name="Front Squat", setGroups=[
-                TodaySetGroup(sets=3, reps=6, targetWeight=160, percentOfMax=65, completedSets=0),
-            ]),
-            TodayExercise(name="Romanian Deadlift", setGroups=[
-                TodaySetGroup(sets=4, reps=8, targetWeight=185, completedSets=0),
-            ]),
-            TodayExercise(name="Walking Lunges", setGroups=[
-                TodaySetGroup(sets=3, reps=12, targetWeight=95, completedSets=0),
-            ]),
-        ],
+
+def _get_player_maxes(sb, player_id: str) -> Dict[str, float]:
+    """Return {exercise: weight} for a player's current maxes."""
+    resp = (
+        sb.table("player_maxes")
+        .select("exercise, weight")
+        .eq("player_id", player_id)
+        .execute()
     )
+    return {m["exercise"]: m["weight"] for m in (resp.data if resp else [])}
 
 
 @router.get("/players/{player_id}/dashboard/prs", response_model=List[PersonalRecord])
 def player_prs(player_id: str, user_id: str = Depends(get_current_user)):
+    sb = _require_db()
+
+    resp = (
+        sb.table("vbt_set_summaries")
+        .select("exercise, peak_velocity, created_at")
+        .eq("player_id", player_id)
+        .order("peak_velocity", desc=True)
+        .execute()
+    )
+    rows = resp.data if resp else []
+    if not rows:
+        return []
+
+    # Dedupe to highest peak_velocity per exercise
+    best: Dict[str, dict] = {}
+    for row in rows:
+        ex = row["exercise"]
+        if ex not in best:
+            best[ex] = row
+
+    maxes = _get_player_maxes(sb, player_id)
+
     return [
-        PersonalRecord(exercise="Back Squat", weight=315, unit="lbs", peakVelocity=0.42, date="2026-01-28"),
-        PersonalRecord(exercise="Bench Press", weight=225, unit="lbs", peakVelocity=0.38, date="2026-02-03"),
-        PersonalRecord(exercise="Power Clean", weight=225, unit="lbs", peakVelocity=1.18, date="2026-01-15"),
-        PersonalRecord(exercise="Hang Clean", weight=205, unit="lbs", peakVelocity=1.22, date="2026-02-06"),
-        PersonalRecord(exercise="Deadlift", weight=385, unit="lbs", peakVelocity=0.35, date="2026-01-22"),
-        PersonalRecord(exercise="Front Squat", weight=245, unit="lbs", peakVelocity=0.48, date="2026-02-01"),
+        PersonalRecord(
+            exercise=ex,
+            weight=maxes.get(ex, 0),
+            unit="lbs",
+            peakVelocity=round(float(row["peak_velocity"]), 2),
+            date=row["created_at"][:10],
+        )
+        for ex, row in best.items()
     ]
 
 
 @router.get("/players/{player_id}/dashboard/recent-sessions", response_model=List[WorkoutSession])
 def player_recent_sessions(player_id: str, user_id: str = Depends(get_current_user)):
+    sb = _require_db()
+
+    resp = (
+        sb.table("vbt_set_summaries")
+        .select("id, exercise, rep_count, avg_velocity, peak_velocity, created_at")
+        .eq("player_id", player_id)
+        .order("created_at", desc=True)
+        .limit(20)
+        .execute()
+    )
+    rows = resp.data if resp else []
+    if not rows:
+        return []
+
+    maxes = _get_player_maxes(sb, player_id)
+
     return [
-        WorkoutSession(id="s1", date="2026-02-11", exercise="Back Squat", setsCompleted=5, totalSets=5, repsPerSet=5, avgVelocity=0.65, peakVelocity=0.78, weight=275),
-        WorkoutSession(id="s2", date="2026-02-10", exercise="Bench Press", setsCompleted=4, totalSets=4, repsPerSet=6, avgVelocity=0.48, peakVelocity=0.56, weight=195),
-        WorkoutSession(id="s3", date="2026-02-08", exercise="Power Clean", setsCompleted=4, totalSets=4, repsPerSet=3, avgVelocity=1.02, peakVelocity=1.18, weight=205),
-        WorkoutSession(id="s4", date="2026-02-07", exercise="Back Squat", setsCompleted=5, totalSets=5, repsPerSet=3, avgVelocity=0.58, peakVelocity=0.71, weight=295),
-        WorkoutSession(id="s5", date="2026-02-05", exercise="Hang Clean", setsCompleted=5, totalSets=5, repsPerSet=3, avgVelocity=1.08, peakVelocity=1.22, weight=185),
-        WorkoutSession(id="s6", date="2026-02-04", exercise="Front Squat", setsCompleted=3, totalSets=4, repsPerSet=6, avgVelocity=0.55, peakVelocity=0.64, weight=215),
-        WorkoutSession(id="s7", date="2026-02-03", exercise="Bench Press", setsCompleted=5, totalSets=5, repsPerSet=5, avgVelocity=0.44, peakVelocity=0.52, weight=205),
-        WorkoutSession(id="s8", date="2026-02-01", exercise="Deadlift", setsCompleted=4, totalSets=4, repsPerSet=3, avgVelocity=0.38, peakVelocity=0.45, weight=365),
+        WorkoutSession(
+            id=row["id"],
+            date=row["created_at"][:10],
+            exercise=row["exercise"],
+            setsCompleted=1,
+            totalSets=1,
+            repsPerSet=row["rep_count"],
+            avgVelocity=round(float(row["avg_velocity"]), 2),
+            peakVelocity=round(float(row["peak_velocity"]), 2),
+            weight=maxes.get(row["exercise"], 0),
+        )
+        for row in rows
     ]
 
 
 @router.get("/players/{player_id}/dashboard/velocity-trends", response_model=Dict[str, List[TrendPoint]])
 def player_velocity_trends(player_id: str, user_id: str = Depends(get_current_user)):
-    return {
-        "Back Squat": [
-            TrendPoint(date="2025-12-15", avgVelocity=0.58, estimatedMax=285),
-            TrendPoint(date="2025-12-22", avgVelocity=0.60, estimatedMax=290),
-            TrendPoint(date="2025-12-29", avgVelocity=0.59, estimatedMax=288),
-            TrendPoint(date="2026-01-05", avgVelocity=0.62, estimatedMax=295),
-            TrendPoint(date="2026-01-12", avgVelocity=0.61, estimatedMax=293),
-            TrendPoint(date="2026-01-19", avgVelocity=0.64, estimatedMax=300),
-            TrendPoint(date="2026-01-26", avgVelocity=0.63, estimatedMax=298),
-            TrendPoint(date="2026-02-02", avgVelocity=0.66, estimatedMax=308),
-            TrendPoint(date="2026-02-09", avgVelocity=0.65, estimatedMax=305),
-        ],
-        "Bench Press": [
-            TrendPoint(date="2025-12-15", avgVelocity=0.40, estimatedMax=205),
-            TrendPoint(date="2025-12-22", avgVelocity=0.41, estimatedMax=208),
-            TrendPoint(date="2025-12-29", avgVelocity=0.42, estimatedMax=210),
-            TrendPoint(date="2026-01-05", avgVelocity=0.41, estimatedMax=208),
-            TrendPoint(date="2026-01-12", avgVelocity=0.43, estimatedMax=213),
-            TrendPoint(date="2026-01-19", avgVelocity=0.44, estimatedMax=215),
-            TrendPoint(date="2026-01-26", avgVelocity=0.44, estimatedMax=218),
-            TrendPoint(date="2026-02-02", avgVelocity=0.46, estimatedMax=222),
-            TrendPoint(date="2026-02-09", avgVelocity=0.48, estimatedMax=225),
-        ],
-        "Power Clean": [
-            TrendPoint(date="2025-12-15", avgVelocity=0.92, estimatedMax=195),
-            TrendPoint(date="2025-12-22", avgVelocity=0.95, estimatedMax=198),
-            TrendPoint(date="2025-12-29", avgVelocity=0.94, estimatedMax=197),
-            TrendPoint(date="2026-01-05", avgVelocity=0.97, estimatedMax=202),
-            TrendPoint(date="2026-01-12", avgVelocity=0.98, estimatedMax=205),
-            TrendPoint(date="2026-01-19", avgVelocity=1.00, estimatedMax=210),
-            TrendPoint(date="2026-01-26", avgVelocity=1.01, estimatedMax=212),
-            TrendPoint(date="2026-02-02", avgVelocity=1.02, estimatedMax=215),
-            TrendPoint(date="2026-02-09", avgVelocity=1.05, estimatedMax=220),
-        ],
-    }
+    sb = _require_db()
+
+    resp = (
+        sb.table("vbt_set_summaries")
+        .select("exercise, avg_velocity, estimated_1rm, created_at")
+        .eq("player_id", player_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    rows = resp.data if resp else []
+    if not rows:
+        return {}
+
+    # Group by exercise -> date -> rows
+    exercise_dates: Dict[str, Dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    for row in rows:
+        exercise_dates[row["exercise"]][row["created_at"][:10]].append(row)
+
+    result: Dict[str, List[TrendPoint]] = {}
+    for ex, dates in exercise_dates.items():
+        points = []
+        for date in sorted(dates.keys()):
+            day_rows = dates[date]
+            avg_vel = sum(float(r["avg_velocity"]) for r in day_rows) / len(day_rows)
+            est_1rms = [
+                float(r["estimated_1rm"])
+                for r in day_rows
+                if r.get("estimated_1rm") is not None
+            ]
+            avg_1rm = sum(est_1rms) / len(est_1rms) if est_1rms else 0
+            points.append(TrendPoint(
+                date=date,
+                avgVelocity=round(avg_vel, 2),
+                estimatedMax=round(avg_1rm),
+            ))
+        result[ex] = points
+
+    return result
 
 
 @router.get("/players/{player_id}/dashboard/position-comparison", response_model=List[PositionComparison])
 def player_position_comparison(player_id: str, user_id: str = Depends(get_current_user)):
-    return [
-        PositionComparison(exercise="Back Squat", playerAvgVelocity=0.65, groupAvgVelocity=0.58, percentile=78, positionGroup="Power"),
-        PositionComparison(exercise="Bench Press", playerAvgVelocity=0.48, groupAvgVelocity=0.45, percentile=65, positionGroup="Power"),
-        PositionComparison(exercise="Power Clean", playerAvgVelocity=1.02, groupAvgVelocity=0.94, percentile=82, positionGroup="Power"),
-        PositionComparison(exercise="Hang Clean", playerAvgVelocity=1.08, groupAvgVelocity=1.01, percentile=71, positionGroup="Power"),
-    ]
+    sb = _require_db()
+
+    # Look up player's team and position group
+    player_resp = (
+        sb.table("players")
+        .select("team_id, position_group")
+        .eq("id", player_id)
+        .single()
+        .execute()
+    )
+    if not player_resp or not player_resp.data:
+        return []
+
+    player = player_resp.data
+    position_group = player.get("position_group")
+    team_id = player["team_id"]
+
+    if not position_group:
+        return []
+
+    # Find all teammates with same position group
+    teammates_resp = (
+        sb.table("players")
+        .select("id")
+        .eq("team_id", team_id)
+        .eq("position_group", position_group)
+        .execute()
+    )
+    teammate_ids = [t["id"] for t in (teammates_resp.data if teammates_resp else [])]
+    if not teammate_ids:
+        return []
+
+    # Get all VBT data for these teammates
+    vbt_resp = (
+        sb.table("vbt_set_summaries")
+        .select("player_id, exercise, avg_velocity")
+        .in_("player_id", teammate_ids)
+        .execute()
+    )
+    vbt_rows = vbt_resp.data if vbt_resp else []
+    if not vbt_rows:
+        return []
+
+    # Group by exercise -> player -> velocities
+    exercise_player_vels: Dict[str, Dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    for row in vbt_rows:
+        exercise_player_vels[row["exercise"]][row["player_id"]].append(
+            float(row["avg_velocity"])
+        )
+
+    results = []
+    for exercise, player_vels in exercise_player_vels.items():
+        if player_id not in player_vels:
+            continue
+
+        player_avg = sum(player_vels[player_id]) / len(player_vels[player_id])
+
+        # Group average across all teammates
+        all_vels = [v for vels in player_vels.values() for v in vels]
+        group_avg = sum(all_vels) / len(all_vels) if all_vels else 0
+
+        # Percentile: fraction of teammates with lower average
+        teammate_avgs = [sum(vels) / len(vels) for vels in player_vels.values()]
+        if len(teammate_avgs) <= 1:
+            percentile = 50
+        else:
+            below = sum(1 for avg in teammate_avgs if avg < player_avg)
+            percentile = round(below / len(teammate_avgs) * 100)
+
+        results.append(PositionComparison(
+            exercise=exercise,
+            playerAvgVelocity=round(player_avg, 2),
+            groupAvgVelocity=round(group_avg, 2),
+            percentile=percentile,
+            positionGroup=position_group.capitalize(),
+        ))
+
+    return results
