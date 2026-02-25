@@ -7,7 +7,7 @@ from fastapi import HTTPException
 def require_team_access(sb, team_id: str, user_id: str) -> dict:
     """Return team row if user is owner OR in team_coaches. Raise 404 otherwise."""
     team_resp = sb.table("teams").select("*").eq("id", team_id).maybe_single().execute()
-    if not team_resp.data:
+    if not team_resp or not team_resp.data:
         raise HTTPException(status_code=404, detail="Team not found")
     team = team_resp.data
     if team["coach_id"] == user_id:
@@ -21,7 +21,7 @@ def require_team_access(sb, team_id: str, user_id: str) -> dict:
         .maybe_single()
         .execute()
     )
-    if tc.data:
+    if tc and tc.data:
         return team
     raise HTTPException(status_code=404, detail="Team not found")
 
@@ -29,7 +29,7 @@ def require_team_access(sb, team_id: str, user_id: str) -> dict:
 def require_team_owner(sb, team_id: str, user_id: str) -> dict:
     """Return team row if user is the owner (coach_id). Raise 403 otherwise."""
     team_resp = sb.table("teams").select("*").eq("id", team_id).maybe_single().execute()
-    if not team_resp.data:
+    if not team_resp or not team_resp.data:
         raise HTTPException(status_code=404, detail="Team not found")
     if team_resp.data["coach_id"] != user_id:
         raise HTTPException(status_code=403, detail="Only the head coach can do this")

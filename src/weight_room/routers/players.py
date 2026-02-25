@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from weight_room.auth import get_current_user
 from weight_room.core.access import require_team_access
-from weight_room.core.models import ClaimInviteRequest, PlayerCreate, PlayerMeOut, PlayerOut, PlayerUpdate
+from weight_room.core.models import ClaimInviteRequest, PlayerCreate, PlayerMeOut, PlayerOut, PlayerUpdate, TeamOut
 from weight_room.db import get_supabase
 
 router = APIRouter(tags=["players"])
@@ -92,6 +92,27 @@ def get_my_player(user_id: str = Depends(get_current_user)):
     )
     player["teams"] = t_resp.data if t_resp else None
     return player
+
+
+@router.get("/players/me/team", response_model=Optional[TeamOut])
+def get_my_team(user_id: str = Depends(get_current_user)):
+    """Return the team for the currently linked player. No coach access needed."""
+    sb = _require_db()
+    # Find the player linked to this user
+    p_resp = (
+        sb.table("players")
+        .select("team_id")
+        .eq("linked_user_id", user_id)
+        .maybe_single()
+        .execute()
+    )
+    if not p_resp or not p_resp.data:
+        return None
+    team_id = p_resp.data["team_id"]
+    t_resp = sb.table("teams").select("*").eq("id", team_id).maybe_single().execute()
+    if not t_resp or not t_resp.data:
+        return None
+    return t_resp.data
 
 
 # ── /players/{player_id} wildcard routes ─────────────────────────────────
