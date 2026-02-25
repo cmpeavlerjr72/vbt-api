@@ -481,6 +481,13 @@ class WorkoutExerciseLogOut(BaseModel):
     created_at: str
 
 
+class SetGroupDetail(BaseModel):
+    sets: int
+    reps: int
+    target_weight_lbs: Optional[float] = None
+    percent_of_max: Optional[float] = None
+
+
 class ExerciseProgress(BaseModel):
     exercise_name: str
     tracking_mode: str  # 'vbt' | 'self_report'
@@ -488,6 +495,7 @@ class ExerciseProgress(BaseModel):
     sets_completed: int
     weight_lbs: Optional[float] = None
     reps_per_set: Optional[int] = None
+    set_groups: List[SetGroupDetail] = []
 
 
 class ActiveWorkout(BaseModel):

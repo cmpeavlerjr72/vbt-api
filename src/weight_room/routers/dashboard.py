@@ -24,7 +24,7 @@ from weight_room.core.models import (
     WorkoutSession,
 )
 from weight_room.db import get_supabase
-from weight_room.routers.workouts import _parse_exercises
+from weight_room.routers.workouts import _parse_exercises, _resolve_weight
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +108,62 @@ def _assignment_vbt_window(assignment, fallback_start, fallback_end):
         window_end = fallback_end
 
     return window_start, window_end
+
+
+def _build_weight_resolver(sb, player_id: str, player_maxes: Dict[str, float]):
+    """Build a callable that resolves weight for a (exercise, created_at) pair.
+
+    Looks up active assignments for the player's team, parses their templates,
+    and matches by exercise name + time window to compute:
+        target_weight = percentOfMax / 100 * player_max  (rounded to nearest 5 lbs)
+    Falls back to 0 if no matching assignment found.
+    """
+    # Get player's team
+    _p_resp = sb.table("players").select("team_id").eq("id", player_id).execute()
+    if not _p_resp or not _p_resp.data:
+        return lambda exercise, created_at: 0
+
+    team_id = _p_resp.data[0]["team_id"]
+
+    # Fetch assignments with templates for this team
+    _a_resp = (
+        sb.table("workout_assignments")
+        .select("id, start_at, due_at, created_at, workout_templates(content)")
+        .eq("team_id", team_id)
+        .execute()
+    )
+    assignments = _a_resp.data if _a_resp else []
+
+    # Build lookup: list of (exercise, window_start, window_end, percentOfMax, fixedWeight)
+    entries: list[tuple] = []
+    for a in assignments:
+        tmpl = a.get("workout_templates")
+        content = tmpl.get("content", {}) if isinstance(tmpl, dict) and tmpl else {}
+        parsed = _parse_exercises(content)
+        w_start, w_end = _assignment_vbt_window(
+            a,
+            a.get("created_at", ""),
+            (a.get("due_at") or a.get("created_at", ""))[:10] + "T23:59:59+00:00",
+        )
+        for ex in parsed:
+            for sg in ex.get("set_groups", []):
+                entries.append((
+                    ex["exercise_name"],
+                    w_start,
+                    w_end,
+                    sg.get("percentOfMax"),
+                    sg.get("fixedWeight"),
+                ))
+
+    def resolve(exercise: str, created_at: str) -> float:
+        for ex_name, w_start, w_end, pct, fixed in entries:
+            if ex_name == exercise and w_start <= created_at <= w_end:
+                w = _resolve_weight(pct, fixed, player_maxes.get(exercise))
+                if w is not None:
+                    return w
+        return 0
+
+    return resolve
 
 
 def _fetch_junction_map(sb, assignments: list) -> Dict[str, set]:
@@ -829,7 +885,7 @@ def team_live_activity(team_id: str, user_id: str = Depends(get_current_user)):
         s["raw_set_id"]: s for s in (summary_resp.data if summary_resp else [])
     }
 
-    # Get player maxes for weights
+    # Get player maxes for weight resolution
     player_ids = list(seen_players.keys())
     maxes_resp = (
         sb.table("player_maxes")
@@ -837,14 +893,21 @@ def team_live_activity(team_id: str, user_id: str = Depends(get_current_user)):
         .in_("player_id", player_ids)
         .execute()
     )
-    maxes: Dict[tuple, float] = {}
+    # Build per-player maxes: {player_id: {exercise: weight}}
+    per_player_maxes: Dict[str, Dict[str, float]] = {}
     for m in (maxes_resp.data if maxes_resp else []):
-        maxes[(m["player_id"], m["exercise"])] = m["weight"]
+        per_player_maxes.setdefault(m["player_id"], {})[m["exercise"]] = m["weight"]
+
+    # Build weight resolvers per player
+    resolvers: Dict[str, object] = {}
+    for pid in player_ids:
+        resolvers[pid] = _build_weight_resolver(sb, pid, per_player_maxes.get(pid, {}))
 
     results = []
     for pid, row in seen_players.items():
         player = row.get("players", {})
         summary = summaries.get(row["id"], {})
+        resolve = resolvers.get(pid, lambda ex, ts: 0)
 
         results.append(LivePlayerActivity(
             playerId=pid,
@@ -852,7 +915,7 @@ def team_live_activity(team_id: str, user_id: str = Depends(get_current_user)):
             jerseyNumber=player.get("jersey_number") or 0,
             positionGroup=(player.get("position_group") or "skill").capitalize(),
             exercise=row["exercise"],
-            weight=maxes.get((pid, row["exercise"]), 0),
+            weight=resolve(row["exercise"], row["created_at"]),
             avgVelocity=round(float(summary.get("avg_velocity", 0)), 2),
             peakVelocity=round(float(summary.get("peak_velocity", 0)), 2),
             repCount=summary.get("rep_count", 0),
@@ -900,11 +963,12 @@ def player_prs(player_id: str, user_id: str = Depends(get_current_user)):
             best[ex] = row
 
     maxes = _get_player_maxes(sb, player_id)
+    resolve = _build_weight_resolver(sb, player_id, maxes)
 
     return [
         PersonalRecord(
             exercise=ex,
-            weight=maxes.get(ex, 0),
+            weight=resolve(ex, row["created_at"]),
             unit="lbs",
             peakVelocity=round(float(row["peak_velocity"]), 2),
             date=row["created_at"][:10],
@@ -930,6 +994,7 @@ def player_recent_sessions(player_id: str, user_id: str = Depends(get_current_us
         return []
 
     maxes = _get_player_maxes(sb, player_id)
+    resolve = _build_weight_resolver(sb, player_id, maxes)
 
     return [
         WorkoutSession(
@@ -941,7 +1006,7 @@ def player_recent_sessions(player_id: str, user_id: str = Depends(get_current_us
             repsPerSet=row["rep_count"],
             avgVelocity=round(float(row["avg_velocity"]), 2),
             peakVelocity=round(float(row["peak_velocity"]), 2),
-            weight=maxes.get(row["exercise"], 0),
+            weight=resolve(row["exercise"], row["created_at"]),
         )
         for row in rows
     ]

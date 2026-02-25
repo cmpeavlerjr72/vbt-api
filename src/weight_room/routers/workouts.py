@@ -11,6 +11,7 @@ from weight_room.core.models import (
     ActiveWorkout,
     ExerciseProgress,
     PlayerProgress,
+    SetGroupDetail,
     WorkoutAssignmentCreate,
     WorkoutAssignmentOut,
     WorkoutExerciseLogIn,
@@ -173,21 +174,39 @@ def _parse_exercises(content: dict) -> list[dict]:
             if tracking is None:
                 tracking = "vbt" if name in _VBT_EXERCISES else "self_report"
             total_sets = sum(sg.get("sets", 0) for sg in set_groups)
+            parsed_groups = [
+                {"sets": sg.get("sets", 0), "reps": sg.get("reps", 0),
+                 "percentOfMax": sg.get("percentOfMax"), "fixedWeight": sg.get("fixedWeight")}
+                for sg in set_groups
+            ]
         else:
             name = ex.get("name", "")
             tracking = "vbt" if name in _VBT_EXERCISES else "self_report"
             total_sets = ex.get("sets", 0)
+            parsed_groups = [{"sets": total_sets, "reps": ex.get("reps", 0),
+                              "percentOfMax": None, "fixedWeight": None}]
         result.append({
             "exercise_name": name,
             "tracking_mode": tracking,
             "sets_required": total_sets,
+            "set_groups": parsed_groups,
         })
     return result
+
+
+def _resolve_weight(pct: float | None, fixed: float | None, max_w: float | None) -> float | None:
+    """Resolve target weight from percentOfMax or fixedWeight, rounding to nearest 5 lbs."""
+    if fixed is not None:
+        return fixed
+    if pct is not None and max_w is not None and max_w > 0:
+        return round(pct / 100 * max_w / 5) * 5
+    return None
 
 
 def _compute_exercise_progress(
     sb, parsed_exercises: list[dict], player_id: str, assignment_id: str,
     start_at: str | None, due_at: str | None, created_at: str,
+    player_maxes: dict | None = None,
 ) -> list[ExerciseProgress]:
     """For each exercise, compute sets_completed from VBT or self-report data."""
     progress = []
@@ -238,6 +257,18 @@ def _compute_exercise_progress(
                 weight = row.get("weight_lbs")
                 reps = row.get("reps_per_set")
 
+        # Build resolved set group details
+        max_w = (player_maxes or {}).get(name)
+        set_group_details = []
+        for sg in ex.get("set_groups", []):
+            target = _resolve_weight(sg.get("percentOfMax"), sg.get("fixedWeight"), max_w)
+            set_group_details.append(SetGroupDetail(
+                sets=sg.get("sets", 0),
+                reps=sg.get("reps", 0),
+                target_weight_lbs=target,
+                percent_of_max=sg.get("percentOfMax"),
+            ))
+
         progress.append(ExerciseProgress(
             exercise_name=name,
             tracking_mode=mode,
@@ -245,6 +276,7 @@ def _compute_exercise_progress(
             sets_completed=sets_done,
             weight_lbs=weight,
             reps_per_set=reps,
+            set_groups=set_group_details,
         ))
     return progress
 
@@ -262,6 +294,15 @@ def get_active_workouts(player_id: str, user_id: str = Depends(get_current_user)
     if not player_resp or not player_resp.data:
         raise HTTPException(status_code=404, detail="Player not found")
     player = player_resp.data[0]
+
+    # Fetch player maxes once for weight resolution
+    _maxes_resp = (
+        sb.table("player_maxes")
+        .select("exercise, weight")
+        .eq("player_id", player_id)
+        .execute()
+    )
+    player_maxes = {m["exercise"]: m["weight"] for m in (_maxes_resp.data if _maxes_resp else [])}
 
     # Get active assignments for the player's team
     assign_resp = (
@@ -307,6 +348,7 @@ def get_active_workouts(player_id: str, user_id: str = Depends(get_current_user)
             sb, parsed, player_id, assignment["id"],
             assignment.get("start_at"), assignment.get("due_at"),
             assignment["created_at"],
+            player_maxes=player_maxes,
         )
 
         results.append(ActiveWorkout(
