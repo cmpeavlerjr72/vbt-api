@@ -8,15 +8,21 @@ create table if not exists public.profiles (
   created_at  timestamptz not null default now()
 );
 
--- Auto-create a profile row when a new user signs up
+-- Auto-create a profile row when a new user signs up.
+-- Reads role from auth metadata (passed via signUp options.data.role),
+-- defaults to 'coach' for backwards compatibility.
 create or replace function public.handle_new_user()
 returns trigger
 language plpgsql
 security definer set search_path = ''
 as $$
 begin
-  insert into public.profiles (id, email)
-  values (new.id, new.email)
+  insert into public.profiles (id, email, role)
+  values (
+    new.id,
+    new.email,
+    coalesce(new.raw_user_meta_data ->> 'role', 'coach')
+  )
   on conflict (id) do nothing;
   return new;
 end;

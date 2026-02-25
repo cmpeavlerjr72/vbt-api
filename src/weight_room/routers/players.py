@@ -57,12 +57,13 @@ def create_player(team_id: str, body: PlayerCreate, user_id: str = Depends(get_c
 @router.post("/players/claim", response_model=PlayerOut)
 def claim_invite(body: ClaimInviteRequest, user_id: str = Depends(get_current_user)):
     sb = _require_db()
-    # Use the RPC function for atomic claim
+    # Use the RPC function for atomic claim — pass uid explicitly since
+    # service-role calls have auth.uid() = NULL
     try:
-        resp = sb.rpc("claim_invite_code", {"code": body.invite_code}).execute()
+        resp = sb.rpc("claim_invite_code", {"code": body.invite_code, "uid": user_id}).execute()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    if not resp.data:
+    if not resp or not resp.data:
         raise HTTPException(status_code=400, detail="Failed to claim invite code")
     return resp.data
 
@@ -72,12 +73,12 @@ def get_my_player(user_id: str = Depends(get_current_user)):
     sb = _require_db()
     resp = (
         sb.table("players")
-        .select("id, team_id, first_name, last_name, linked_user_id, linked_at")
+        .select("id, team_id, first_name, last_name, jersey_number, position_group, linked_user_id, linked_at")
         .eq("linked_user_id", user_id)
         .maybe_single()
         .execute()
     )
-    if not resp.data:
+    if not resp or not resp.data:
         return None
     player = resp.data
 
@@ -89,7 +90,7 @@ def get_my_player(user_id: str = Depends(get_current_user)):
         .maybe_single()
         .execute()
     )
-    player["teams"] = t_resp.data
+    player["teams"] = t_resp.data if t_resp else None
     return player
 
 

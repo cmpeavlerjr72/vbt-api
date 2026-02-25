@@ -110,6 +110,8 @@ class PlayerMeOut(BaseModel):
     team_id: str
     first_name: str
     last_name: str
+    jersey_number: Optional[int] = None
+    position_group: Optional[str] = None
     linked_user_id: Optional[str] = None
     linked_at: Optional[str] = None
     teams: Optional[Dict[str, Any]] = None
