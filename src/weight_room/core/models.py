@@ -131,6 +131,29 @@ class PlayerMaxOut(BaseModel):
 class PlayerMaxUpsert(BaseModel):
     exercise: str
     weight: float
+    tested_at: Optional[str] = None
+
+
+# ── Bulk Import ─────────────────────────────────────────────────────────────
+
+class BulkMaxRow(BaseModel):
+    """One row of a bulk max import: player name + exercise + weight + date."""
+    first_name: str
+    last_name: str
+    exercise: str
+    weight: float
+    tested_at: str  # ISO date string, e.g. "2026-01-15"
+
+
+class BulkMaxImportRequest(BaseModel):
+    rows: List[BulkMaxRow]
+
+
+class BulkMaxImportResult(BaseModel):
+    players_created: int
+    maxes_upserted: int
+    skipped: int
+    errors: List[str] = []
 
 
 class PlayerMaxHistoryOut(BaseModel):
@@ -456,6 +479,33 @@ class DeviceSetIn(BaseModel):
 class DeviceSetOut(BaseModel):
     set_id: str
     reps_created: int
+
+
+class DeviceRegister(BaseModel):
+    device_id: str
+    label: Optional[str] = None
+
+
+class DeviceOut(BaseModel):
+    id: str
+    device_id: str
+    coach_id: str
+    label: Optional[str] = None
+    created_at: str
+
+
+class DeviceStatusOut(BaseModel):
+    paired: bool
+    coach_name: Optional[str] = None
+
+
+class DeviceLookupPlayer(BaseModel):
+    id: str
+    first_name: str
+    last_name: str
+    jersey_number: Optional[int] = None
+    team_id: str
+    team_name: Optional[str] = None
 
 
 # ── Workout Logging ─────────────────────────────────────────────────────
