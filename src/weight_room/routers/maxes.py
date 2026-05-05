@@ -65,7 +65,7 @@ def upsert_player_max(
                 "player_id": player_id,
                 "exercise": body.exercise,
                 "weight": body.weight,
-                "tested_at": datetime.now(timezone.utc).isoformat(),
+                "tested_at": body.tested_at or datetime.now(timezone.utc).isoformat(),
             },
             on_conflict="player_id,exercise",
         )
