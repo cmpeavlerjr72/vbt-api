@@ -328,73 +328,66 @@ def get_roster(team_id: str):
 
 @router.post("/sets", response_model=DeviceSetOut, status_code=201)
 def create_set(body: DeviceSetIn):
+    """Persist a completed set (raw_set + reps + summary) atomically.
+
+    All three table writes happen inside a single Postgres transaction via
+    the insert_device_set RPC (sql/21_insert_device_set_rpc.sql). Either
+    everything commits or nothing does — no more orphaned raw_sets if the
+    network blips between writes.
+    """
     sb = _require_db()
 
+    # Compute set-level summary stats in Python so the SQL function stays dumb.
+    mean_vels = [r.mean_velocity for r in body.reps]
+    peak_vels = [r.peak_velocity for r in body.reps]
+    avg_velocity = sum(mean_vels) / len(mean_vels) if mean_vels else 0
+    peak_velocity = max(peak_vels) if peak_vels else 0
+    velocity_loss = None
+    if len(mean_vels) >= 2 and mean_vels[0] > 0:
+        velocity_loss = (mean_vels[0] - mean_vels[-1]) / mean_vels[0] * 100
+
+    # Serialize reps as plain JSON for the RPC's jsonb argument.
+    reps_payload = [
+        {
+            "rep_number": r.rep_number,
+            "mean_velocity": r.mean_velocity,
+            "peak_velocity": r.peak_velocity,
+            "rom_meters": r.rom_meters,
+            "concentric_duration": r.concentric_duration,
+            "eccentric_duration": r.eccentric_duration,
+            "conc_peak_accel": r.conc_peak_accel,
+            "ecc_peak_velocity": r.ecc_peak_velocity,
+            "ecc_peak_accel": r.ecc_peak_accel,
+            "samples": [s.model_dump() for s in r.samples],
+        }
+        for r in body.reps
+    ]
+
     try:
-        # 1. Create raw set
-        raw_set_resp = (
-            sb.table("vbt_raw_sets")
-            .insert({
-                "player_id": body.player_id,
-                "team_id": body.team_id,
-                "exercise": body.exercise,
-                "device_id": body.device_id,
-                "samples": [],
-                "processed": True,
-            })
-            .execute()
-        )
-        if not raw_set_resp or not raw_set_resp.data:
-            raise HTTPException(status_code=500, detail="Failed to create raw set")
-        raw_set = raw_set_resp.data[0]
-        set_id = raw_set["id"]
-
-        # 2. Create reps
-        rep_rows = []
-        for r in body.reps:
-            rep_rows.append({
-                "raw_set_id": set_id,
-                "player_id": body.player_id,
-                "exercise": body.exercise,
-                "rep_number": r.rep_number,
-                "mean_velocity": r.mean_velocity,
-                "peak_velocity": r.peak_velocity,
-                "rom_meters": r.rom_meters,
-                "concentric_duration": r.concentric_duration,
-                "eccentric_duration": r.eccentric_duration,
-                "conc_peak_accel": r.conc_peak_accel,
-                "ecc_peak_velocity": r.ecc_peak_velocity,
-                "ecc_peak_accel": r.ecc_peak_accel,
-                "samples": [s.model_dump() for s in r.samples],
-            })
-        if rep_rows:
-            sb.table("vbt_reps").insert(rep_rows).execute()
-
-        # 3. Compute and create set summary
-        mean_vels = [r.mean_velocity for r in body.reps]
-        peak_vels = [r.peak_velocity for r in body.reps]
-        avg_velocity = sum(mean_vels) / len(mean_vels) if mean_vels else 0
-        peak_velocity = max(peak_vels) if peak_vels else 0
-
-        velocity_loss = None
-        if len(mean_vels) >= 2 and mean_vels[0] > 0:
-            velocity_loss = (mean_vels[0] - mean_vels[-1]) / mean_vels[0] * 100
-
-        sb.table("vbt_set_summaries").insert({
-            "raw_set_id": set_id,
-            "player_id": body.player_id,
-            "exercise": body.exercise,
-            "rep_count": len(body.reps),
-            "avg_velocity": round(avg_velocity, 4),
-            "peak_velocity": round(peak_velocity, 4),
-            "velocity_loss": round(velocity_loss, 2) if velocity_loss is not None else None,
-            "flagged": False,
-        }).execute()
-
-    except HTTPException:
-        raise
+        resp = sb.rpc(
+            "insert_device_set",
+            {
+                "p_player_id":     body.player_id,
+                "p_team_id":       body.team_id,
+                "p_exercise":      body.exercise,
+                "p_device_id":     body.device_id,
+                "p_reps":          reps_payload,
+                "p_avg_velocity":  round(avg_velocity, 4),
+                "p_peak_velocity": round(peak_velocity, 4),
+                "p_velocity_loss": round(velocity_loss, 2) if velocity_loss is not None else None,
+            },
+        ).execute()
     except Exception as exc:
         log.exception("device set creation failed")
         raise HTTPException(status_code=500, detail=f"Set creation failed: {exc}")
 
-    return DeviceSetOut(set_id=set_id, reps_created=len(body.reps))
+    if not resp or not resp.data:
+        raise HTTPException(status_code=500, detail="insert_device_set returned no data")
+
+    # The RPC returns jsonb {"set_id": uuid, "reps_created": int}; PostgREST
+    # delivers it either wrapped in a list (one row) or directly as the dict.
+    payload = resp.data[0] if isinstance(resp.data, list) else resp.data
+    return DeviceSetOut(
+        set_id=payload["set_id"],
+        reps_created=payload["reps_created"],
+    )
