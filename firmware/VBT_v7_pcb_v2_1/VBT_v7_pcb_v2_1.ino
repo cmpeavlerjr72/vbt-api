@@ -84,9 +84,9 @@
 
 // Button resistor ladder (12-bit ADC; thresholds from breadboard test)
 #define BTN_PIN         7
-#define BTN_GREEN_MIN   3535   // GREEN ~3720
-#define BTN_RED_MIN     3070   // RED   ~3350
-#define BTN_YELLOW_MIN  1400   // YELLOW ~2790; well above noise floor
+#define BTN_GREEN_MIN   3535   // GREEN  ~3720 (1K)
+#define BTN_YELLOW_MIN  3070   // YELLOW ~3350 (2.2K)
+#define BTN_RED_MIN     1400   // RED    ~2790 (4.7K); well above noise floor
 
 #define BTN_DEBOUNCE_MS        50
 #define RED_LONG_PRESS_MS      3000
@@ -277,8 +277,8 @@ bool yellowLongFired = false;
 Button readButtonRaw() {
   int v = analogRead(BTN_PIN);
   if (v >= BTN_GREEN_MIN)  return BTN_GREEN;
-  if (v >= BTN_RED_MIN)    return BTN_RED;
   if (v >= BTN_YELLOW_MIN) return BTN_YELLOW;
+  if (v >= BTN_RED_MIN)    return BTN_RED;
   return BTN_NONE;
 }
 
@@ -1331,10 +1331,15 @@ void loop() {
     if (pollTag(uid)) {
       Serial.print("Tag: "); Serial.println(uid);
       tft.fillScreen(GC9A01A_BLACK);
-      drawCenteredText("Looking up", 100, GC9A01A_YELLOW, 2);
+      drawCenteredText("Looking up", 80, GC9A01A_YELLOW, 2);
+      drawCenteredText(uid.c_str(), 130, GC9A01A_WHITE, 1);
       int n = lookupTag(uid);
       if (n == 0) {
-        flashMessage("Unknown", "tag", GC9A01A_RED, 1500);
+        tft.fillScreen(GC9A01A_BLACK);
+        drawCenteredText("Unknown tag", 60, GC9A01A_RED, 2);
+        drawCenteredText("UID:", 110, C_GREY, 1);
+        drawCenteredText(uid.c_str(), 130, GC9A01A_WHITE, 2);
+        delay(4000);
       } else if (n == 1) {
         currentPlayer = candidates[0];
         playerLoaded = true;

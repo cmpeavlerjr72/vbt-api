@@ -15,6 +15,46 @@ from weight_room.core.models import (
 )
 from weight_room.db import get_supabase
 
+
+def _uid_candidates(uid: str) -> list[str]:
+    """Return all plausible string forms of a scanned UID so we can match
+    tags registered via different readers (hex vs decimal, big- vs little-endian).
+    """
+    raw = uid.strip()
+    forms: set[str] = {raw}
+
+    hex_clean = raw.replace(":", "").replace("-", "").replace(" ", "")
+    if hex_clean:
+        try:
+            byts = bytes.fromhex(hex_clean)
+            be_int = int.from_bytes(byts, "big")
+            le_int = int.from_bytes(byts, "little")
+            forms.update({
+                hex_clean.upper(),
+                hex_clean.lower(),
+                str(be_int),
+                str(le_int),
+                str(be_int).zfill(10),  # 10-digit decimal printed on EM cards
+                str(le_int).zfill(10),
+            })
+        except ValueError:
+            pass  # not hex — likely already decimal, treat raw as the only form
+
+    if raw.isdigit():
+        try:
+            n = int(raw)
+            byts = n.to_bytes(4, "big")
+            forms.update({
+                byts.hex().upper(),
+                ":".join(f"{b:02X}" for b in byts),
+                ":".join(f"{b:02X}" for b in reversed(byts)),
+                bytes(reversed(byts)).hex().upper(),
+            })
+        except (ValueError, OverflowError):
+            pass
+
+    return list(forms)
+
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/device", tags=["device"])
@@ -109,17 +149,20 @@ def lookup_tag(device_id: str = Query(...), uid: str = Query(...)):
     if not team_ids:
         return []
 
-    # 3. Tags matching uid on those teams
+    # 3. Tags matching uid on those teams. Different readers print the same
+    # card in different formats (hex vs decimal, BE vs LE byte order), so we
+    # match against every plausible string form of the incoming UID.
+    uid_forms = _uid_candidates(uid)
     try:
         tags_resp = (
             sb.table("rfid_tags")
             .select("assigned_player_id, team_id")
-            .eq("uid", uid)
+            .in_("uid", uid_forms)
             .in_("team_id", team_ids)
             .execute()
         )
     except Exception as exc:
-        log.exception("rfid tag lookup failed uid=%s", uid)
+        log.exception("rfid tag lookup failed uid=%s forms=%s", uid, uid_forms)
         raise HTTPException(status_code=500, detail=f"Tag lookup failed: {exc}")
 
     tag_rows = [t for t in (tags_resp.data or []) if t.get("assigned_player_id")]
