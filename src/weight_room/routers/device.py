@@ -214,6 +214,101 @@ def lookup_tag(device_id: str = Query(...), uid: str = Query(...)):
     ]
 
 
+@router.get("/exercises", response_model=List[str])
+def device_exercises(device_id: str = Query(...), player_id: str = Query(...)):
+    """List the player's assigned exercises across all active workout assignments.
+
+    The device calls this after an RFID scan to populate its exercise picker.
+    Returns a flat list of exercise names. Empty list = no active assignments
+    (the device falls back to its built-in default list).
+    """
+    sb = _require_db()
+
+    # 1. Verify device is paired and get coach.
+    dev_resp = (
+        sb.table("devices")
+        .select("coach_id")
+        .eq("device_id", device_id)
+        .maybe_single()
+        .execute()
+    )
+    if not dev_resp or not dev_resp.data:
+        raise HTTPException(status_code=404, detail="Device not paired")
+    coach_id = dev_resp.data["coach_id"]
+
+    # 2. Player + team membership; team must be one the coach can access.
+    player_resp = (
+        sb.table("players")
+        .select("id, team_id, position_group")
+        .eq("id", player_id)
+        .maybe_single()
+        .execute()
+    )
+    if not player_resp or not player_resp.data:
+        raise HTTPException(status_code=404, detail="Player not found")
+    player = player_resp.data
+    team_id = player["team_id"]
+    position_group = player.get("position_group")
+
+    access_resp = (
+        sb.table("team_coaches")
+        .select("team_id")
+        .eq("coach_id", coach_id)
+        .eq("team_id", team_id)
+        .execute()
+    )
+    if not access_resp or not access_resp.data:
+        raise HTTPException(status_code=403, detail="Player not on this device's team")
+
+    # 3. Active assignments for the team.
+    assigns = (
+        sb.table("workout_assignments")
+        .select("id, template_id, target_type, target_position_group")
+        .eq("team_id", team_id)
+        .eq("status", "active")
+        .execute()
+    )
+
+    # Lazy-import the template parser to avoid cross-router import cycles at startup.
+    from weight_room.routers.workouts import _parse_exercises
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for a in (assigns.data or []):
+        target = a.get("target_type", "team")
+        if target == "position_group":
+            if a.get("target_position_group") != position_group:
+                continue
+        elif target == "players":
+            j = (
+                sb.table("workout_assignment_players")
+                .select("player_id")
+                .eq("assignment_id", a["id"])
+                .eq("player_id", player_id)
+                .execute()
+            )
+            if not j.data:
+                continue
+
+        tmpl = (
+            sb.table("workout_templates")
+            .select("content")
+            .eq("id", a["template_id"])
+            .maybe_single()
+            .execute()
+        )
+        if not tmpl or not tmpl.data:
+            continue
+
+        for ex in _parse_exercises(tmpl.data.get("content", {})):
+            name = (ex.get("exercise_name") or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                ordered.append(name)
+
+    return ordered
+
+
 @router.get("/roster/{team_id}", response_model=List[DevicePlayerOut])
 def get_roster(team_id: str):
     sb = _require_db()

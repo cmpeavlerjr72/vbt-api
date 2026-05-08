@@ -14,13 +14,23 @@
        - If paired:   show coach name briefly, advance to WAITING_FOR_TAG
     4. WAITING_FOR_TAG — poll PN532 for an RFID card
        - On read: GET /device/lookup?device_id=X&uid=Y
-       - 0 matches: flash "Unknown tag", stay
-       - 1 match:   load player, advance to IDLE
-       - N matches: scroll selection screen (Yellow=down, Red=up, Green=confirm)
-    5. IDLE — Green starts set, Yellow changes exercise, Yellow long calibrates,
-              Red ejects player back to WAITING_FOR_TAG, Red long sleeps
-    6. RUNNING — VBT pipeline; Red stops set, uploads to /device/sets,
+       - 0 matches: show "Unknown tag" + UID for 4s, stay
+       - 1 match:   load player, fetch assigned exercises, advance to IDLE
+       - N matches: SELECT_PLAYER (Yellow=down, Red=up, Green=confirm)
+    5. IDLE — exercise picker for player's assigned workouts
+       - Green = select highlighted exercise (→ CONFIRM_EXERCISE)
+       - Red   = next exercise in list (wraps)
+       - Yellow= eject player back to WAITING_FOR_TAG
+    6. CONFIRM_EXERCISE — "Start <exercise>?"
+       - Green = yes (→ EXERCISE_READY)
+       - Red   = no  (→ IDLE)
+    7. EXERCISE_READY — pre-set screen
+       - Green = start set (→ RUNNING)
+       - Yellow= calibrate IMU (returns here when done)
+       - Red   = cancel (→ IDLE)
+    8. RUNNING — VBT pipeline; Red stops set, uploads to /device/sets,
                  returns to WAITING_FOR_TAG
+    Power: hardware switch only — no software sleep.
 
   Hardware (v2.1 PCB):
     Display (GC9A01)  SPI  SCK=1, MOSI=2, CS=3, DC=4, RST=9
@@ -42,7 +52,6 @@
 #include <Adafruit_GC9A01A.h>
 #include <Adafruit_PN532.h>
 #include <driver/gpio.h>
-#include <esp_sleep.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -95,9 +104,13 @@
 enum Button { BTN_NONE, BTN_GREEN, BTN_RED, BTN_YELLOW };
 
 // ══════════════════════════════════════════════════════════════════════
-//  EXERCISES (selectable via Yellow short-press)
+//  EXERCISES
+//
+//  After RFID scan the device pulls the player's assigned exercises from
+//  the backend (/device/exercises). If they have none, falls back to the
+//  default list. IDLE (the picker) cycles through whichever list applies.
 // ══════════════════════════════════════════════════════════════════════
-const char* EXERCISES[] = {
+const char* DEFAULT_EXERCISES[] = {
   "Back Squat",
   "Front Squat",
   "Bench Press",
@@ -109,7 +122,13 @@ const char* EXERCISES[] = {
   "Romanian Deadlift",
   "Trap Bar Deadlift"
 };
-const int NUM_EXERCISES = sizeof(EXERCISES) / sizeof(EXERCISES[0]);
+const int NUM_DEFAULT_EXERCISES = sizeof(DEFAULT_EXERCISES) / sizeof(DEFAULT_EXERCISES[0]);
+
+#define MAX_EXERCISES 24
+#define EXERCISE_NAME_LEN 32
+char exerciseList[MAX_EXERCISES][EXERCISE_NAME_LEN];
+int exerciseCount = 0;
+int selectedExercise = 0;
 
 // ══════════════════════════════════════════════════════════════════════
 //  PLAYER (current lifter, set after RFID lookup)
@@ -167,21 +186,22 @@ enum DeviceState {
   PAIRING,
   WAITING_FOR_TAG,
   SELECT_PLAYER,
-  SELECT_EXERCISE,
-  IDLE,
+  IDLE,              // exercise picker
+  CONFIRM_EXERCISE,  // "Start <name>?" yes/no
+  EXERCISE_READY,    // pre-set screen: start, calibrate, cancel
   RUNNING,
   CALIBRATING,
 };
 DeviceState state = BOOT;
 String coachName = "";
 
-// scroll cursor for SELECT_PLAYER and SELECT_EXERCISE
+// Scroll cursor for SELECT_PLAYER (the multi-row list).
+// IDLE uses a simpler single-item-centered layout indexed by selectedExercise.
 int scrollOffset = 0;
 int cursorPos    = 0;
 const int VISIBLE_ROWS = 5;
 
 bool displayDirty = true;
-String activeExercise = "Back Squat";
 
 // ══════════════════════════════════════════════════════════════════════
 //  HARDWARE OBJECTS
@@ -269,10 +289,6 @@ bool readIMU(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
 // ══════════════════════════════════════════════════════════════════════
 bool btnGreenState = false, btnRedState = false, btnYellowState = false;
 unsigned long btnGreenLastChange = 0, btnRedLastChange = 0, btnYellowLastChange = 0;
-unsigned long redPressStart = 0;
-bool redLongFired = false;
-unsigned long yellowPressStart = 0;
-bool yellowLongFired = false;
 
 Button readButtonRaw() {
   int v = analogRead(BTN_PIN);
@@ -286,14 +302,23 @@ Button readButtonRaw() {
 void startSet();
 void stopSet();
 void startCalibration();
-void enterDeepSleep();
 void scrollDown(int totalItems);
 void scrollUp();
 void resetScroll();
 void ejectPlayer();
 int  lookupTag(const String& uid);
 void postSetData();
+void loadPlayerExercises(const char* playerId);
+const char* currentExerciseName();
 
+// Button mapping (single-click everywhere — fires on release):
+//   SPLASH:           GRN = advance to WiFi
+//   WAITING_FOR_TAG:  (no buttons used; tag scan drives state)
+//   SELECT_PLAYER:    GRN = confirm, YEL = down, RED = up
+//   IDLE (picker):    GRN = select (→CONFIRM), RED = next, YEL = eject
+//   CONFIRM_EXERCISE: GRN = yes (→READY),       RED = no (→IDLE)
+//   EXERCISE_READY:   GRN = start,              YEL = calibrate, RED = back (→IDLE)
+//   RUNNING:          RED = stop set
 void handleButtons() {
   unsigned long now = millis();
   Button b = readButtonRaw();
@@ -301,105 +326,107 @@ void handleButtons() {
   bool redNow    = (b == BTN_RED);
   bool yellowNow = (b == BTN_YELLOW);
 
-  // ── Green ──
+  bool greenReleased = false, redReleased = false, yellowReleased = false;
+
   if (greenNow != btnGreenState && (now - btnGreenLastChange) > BTN_DEBOUNCE_MS) {
     btnGreenState = greenNow;
     btnGreenLastChange = now;
-    if (greenNow) {
-      switch (state) {
-        case SPLASH: {
-          state = WIFI_CONNECT;
+    if (!greenNow) greenReleased = true;
+  }
+  if (redNow != btnRedState && (now - btnRedLastChange) > BTN_DEBOUNCE_MS) {
+    btnRedState = redNow;
+    btnRedLastChange = now;
+    if (!redNow) redReleased = true;
+  }
+  if (yellowNow != btnYellowState && (now - btnYellowLastChange) > BTN_DEBOUNCE_MS) {
+    btnYellowState = yellowNow;
+    btnYellowLastChange = now;
+    if (!yellowNow) yellowReleased = true;
+  }
+
+  // ── Green ──
+  if (greenReleased) {
+    switch (state) {
+      case SPLASH:
+        state = WIFI_CONNECT;
+        displayDirty = true;
+        break;
+      case SELECT_PLAYER: {
+        int idx = scrollOffset + cursorPos;
+        if (idx < candidateCount) {
+          currentPlayer = candidates[idx];
+          playerLoaded = true;
+          Serial.print("Selected player: ");
+          Serial.print(currentPlayer.first_name);
+          Serial.print(" "); Serial.println(currentPlayer.last_name);
+          resetScroll();
+          loadPlayerExercises(currentPlayer.id);
+          state = IDLE;
           displayDirty = true;
-          break;
         }
-        case SELECT_PLAYER: {
-          int idx = scrollOffset + cursorPos;
-          if (idx < candidateCount) {
-            currentPlayer = candidates[idx];
-            playerLoaded = true;
-            Serial.print("Selected player: ");
-            Serial.print(currentPlayer.first_name);
-            Serial.print(" "); Serial.println(currentPlayer.last_name);
-            resetScroll();
-            state = IDLE;
-            displayDirty = true;
-          }
-          break;
-        }
-        case SELECT_EXERCISE: {
-          int idx = scrollOffset + cursorPos;
-          if (idx < NUM_EXERCISES) {
-            activeExercise = EXERCISES[idx];
-            Serial.print("Exercise: "); Serial.println(activeExercise);
-            resetScroll();
-            state = IDLE;
-            displayDirty = true;
-          }
-          break;
-        }
-        case IDLE:
-          startSet();
-          break;
-        default:
-          break;
+        break;
       }
+      case IDLE:
+        // Select highlighted exercise → confirmation screen.
+        state = CONFIRM_EXERCISE;
+        displayDirty = true;
+        break;
+      case CONFIRM_EXERCISE:
+        // Yes → ready screen.
+        state = EXERCISE_READY;
+        displayDirty = true;
+        break;
+      case EXERCISE_READY:
+        startSet();
+        break;
+      default:
+        break;
     }
   }
 
   // ── Yellow ──
-  if (yellowNow != btnYellowState && (now - btnYellowLastChange) > BTN_DEBOUNCE_MS) {
-    btnYellowState = yellowNow;
-    btnYellowLastChange = now;
-    if (yellowNow) {
-      yellowPressStart = now;
-      yellowLongFired = false;
-      if (state == SELECT_PLAYER) {
+  if (yellowReleased) {
+    switch (state) {
+      case SELECT_PLAYER:
         scrollDown(candidateCount); displayDirty = true;
-      } else if (state == SELECT_EXERCISE) {
-        scrollDown(NUM_EXERCISES); displayDirty = true;
-      }
-    } else {
-      // released
-      if (!yellowLongFired && state == IDLE) {
-        resetScroll();
-        state = SELECT_EXERCISE;
-        displayDirty = true;
-      }
+        break;
+      case IDLE:
+        // Eject player back to the tag-tap screen.
+        ejectPlayer();
+        break;
+      case EXERCISE_READY:
+        startCalibration();
+        break;
+      default:
+        break;
     }
-  }
-  // Yellow long-press → calibrate (in IDLE only)
-  if (btnYellowState && !yellowLongFired && (now - yellowPressStart) >= YELLOW_LONG_PRESS_MS) {
-    yellowLongFired = true;
-    if (state == IDLE) startCalibration();
   }
 
   // ── Red ──
-  if (redNow != btnRedState && (now - btnRedLastChange) > BTN_DEBOUNCE_MS) {
-    btnRedState = redNow;
-    btnRedLastChange = now;
-    if (redNow) {
-      redPressStart = now;
-      redLongFired = false;
-    } else {
-      if (!redLongFired) {
-        switch (state) {
-          case SELECT_PLAYER:
-          case SELECT_EXERCISE:
-            scrollUp(); displayDirty = true; break;
-          case IDLE:
-            ejectPlayer(); break;
-          case RUNNING:
-            stopSet(); break;
-          default:
-            break;
+  if (redReleased) {
+    switch (state) {
+      case SELECT_PLAYER:
+        scrollUp(); displayDirty = true;
+        break;
+      case IDLE:
+        // Move down through the exercise list (with wrap).
+        if (exerciseCount > 0) {
+          selectedExercise = (selectedExercise + 1) % exerciseCount;
+          displayDirty = true;
         }
-      }
+        break;
+      case CONFIRM_EXERCISE:
+      case EXERCISE_READY:
+        // Back to the picker.
+        state = IDLE;
+        displayDirty = true;
+        break;
+      case RUNNING:
+        stopSet();
+        break;
+      default:
+        break;
     }
-  }
-  // Red long-press → sleep (anywhere except RUNNING)
-  if (btnRedState && !redLongFired && (now - redPressStart) >= RED_LONG_PRESS_MS) {
-    redLongFired = true;
-    if (state != RUNNING) enterDeepSleep();
   }
 }
 
@@ -620,6 +647,56 @@ int lookupTag(const String& uid) {
   return candidateCount;
 }
 
+// Populate exerciseList[] from the player's active workout assignments.
+// Falls back to DEFAULT_EXERCISES on HTTP failure or empty response so the
+// device is always usable. Resets selectedExercise to 0.
+void loadPlayerExercises(const char* playerId) {
+  exerciseCount = 0;
+  selectedExercise = 0;
+  tlsClient.stop();
+
+  HTTPClient http;
+  http.setTimeout(10000);
+  String url = String(BACKEND_URL) + "/device/exercises?device_id=" + DEVICE_ID + "&player_id=" + playerId;
+  Serial.print("HTTP: GET "); Serial.println(url);
+
+  if (http.begin(tlsClient, url) && http.GET() == 200) {
+    String body = http.getString();
+    JsonDocument doc;
+    if (deserializeJson(doc, body) == DeserializationError::Ok) {
+      JsonArray arr = doc.as<JsonArray>();
+      for (JsonVariant v : arr) {
+        if (exerciseCount >= MAX_EXERCISES) break;
+        const char* name = v.as<const char*>();
+        if (name && *name) {
+          strlcpy(exerciseList[exerciseCount++], name, EXERCISE_NAME_LEN);
+        }
+      }
+    }
+  } else {
+    Serial.println("HTTP: exercises fetch failed");
+  }
+  http.end();
+
+  if (exerciseCount > 0) {
+    Serial.print("Loaded "); Serial.print(exerciseCount); Serial.println(" assigned exercises");
+  } else {
+    int n = NUM_DEFAULT_EXERCISES < MAX_EXERCISES ? NUM_DEFAULT_EXERCISES : MAX_EXERCISES;
+    for (int i = 0; i < n; i++) {
+      strlcpy(exerciseList[i], DEFAULT_EXERCISES[i], EXERCISE_NAME_LEN);
+    }
+    exerciseCount = n;
+    Serial.println("No assigned exercises, using defaults");
+  }
+}
+
+const char* currentExerciseName() {
+  if (exerciseCount == 0) return "";
+  if (selectedExercise < 0) return exerciseList[0];
+  if (selectedExercise >= exerciseCount) return exerciseList[exerciseCount - 1];
+  return exerciseList[selectedExercise];
+}
+
 void postSetData() {
   if (storedRepCount == 0) { Serial.println("HTTP: no reps to upload"); return; }
   if (!playerLoaded)       { Serial.println("HTTP: no player, skipping"); return; }
@@ -629,7 +706,7 @@ void postSetData() {
   JsonDocument doc;
   doc["team_id"]   = currentPlayer.team_id;
   doc["player_id"] = currentPlayer.id;
-  doc["exercise"]  = activeExercise;
+  doc["exercise"]  = currentExerciseName();
   doc["device_id"] = DEVICE_ID;
 
   JsonArray repsArr = doc["reps"].to<JsonArray>();
@@ -747,11 +824,6 @@ void drawWaitingForTag() {
   tft.drawCircle(120, 130, 12, GC9A01A_CYAN);
 
   drawCenteredText("Tap your tag", 180, GC9A01A_WHITE, 2);
-
-  tft.setTextColor(C_GREY);
-  tft.setTextSize(1);
-  tft.setCursor(8, 220);
-  tft.print("Ex: "); tft.print(activeExercise);
 }
 
 void drawSelectionScreen(const char* title, int total) {
@@ -786,8 +858,6 @@ void drawSelectionScreen(const char* title, int total) {
       tft.print(" ");
       tft.print(p.last_name[0]);
       tft.print(".");
-    } else if (state == SELECT_EXERCISE && idx < NUM_EXERCISES) {
-      tft.print(EXERCISES[idx]);
     }
     y += rowH;
   }
@@ -807,56 +877,98 @@ void drawSelectionScreen(const char* title, int total) {
   tft.print("GRN=Pick YEL=Down RED=Up");
 }
 
+// Centered text helper that respects the round 240x240 display's
+// safe zone better than setCursor(0, y).
+static void printCentered(const char* s, int y, uint16_t color, int size) {
+  if (!s || !*s) return;
+  tft.setTextSize(size);
+  tft.setTextColor(color);
+  int charW = 6 * size;
+  int w = (int)strlen(s) * charW;
+  int x = (240 - w) / 2;
+  if (x < 0) x = 0;
+  tft.setCursor(x, y);
+  tft.print(s);
+}
+
+// Build "#56 First" header (last name dropped to keep it short on round screen).
+static void buildPlayerHeader(char* out, size_t cap) {
+  if (currentPlayer.jersey_number > 0) {
+    snprintf(out, cap, "#%d %s", currentPlayer.jersey_number, currentPlayer.first_name);
+  } else {
+    snprintf(out, cap, "%s", currentPlayer.first_name);
+  }
+}
+
+// IDLE = exercise picker. GRN selects, RED scrolls down, YEL ejects player.
 void drawIdle() {
   tft.fillScreen(GC9A01A_BLACK);
-  tft.setTextColor(GC9A01A_GREEN);
-  tft.setTextSize(3);
-  tft.setCursor(64, 8);
-  tft.println("READY");
 
-  tft.setTextSize(1);
-  tft.setTextColor(GC9A01A_CYAN);
-  tft.setCursor(6, 42);
-  tft.print("Player: ");
-  tft.setTextColor(GC9A01A_WHITE);
-  if (currentPlayer.jersey_number > 0) {
-    tft.print("#"); tft.print(currentPlayer.jersey_number); tft.print(" ");
-  }
-  tft.print(currentPlayer.first_name);
-  tft.print(" ");
-  tft.print(currentPlayer.last_name);
+  char hdr[40]; buildPlayerHeader(hdr, sizeof(hdr));
+  printCentered(hdr, 22, GC9A01A_CYAN, 2);
 
-  tft.setTextColor(GC9A01A_CYAN);
-  tft.setCursor(6, 56);
-  tft.print("Exercise: ");
-  tft.setTextColor(GC9A01A_WHITE);
-  tft.print(activeExercise);
+  if (exerciseCount > 0) {
+    int sel = selectedExercise;
+    if (sel < 0) sel = 0;
+    if (sel >= exerciseCount) sel = exerciseCount - 1;
 
-  if (lastSetReps > 0) {
-    tft.setTextColor(GC9A01A_WHITE);
-    tft.setTextSize(2);
-    tft.setCursor(24, 80);
-    tft.print("Last set: ");
-    tft.print(lastSetReps);
-    tft.print(" reps");
+    if (sel - 1 >= 0)
+      printCentered(exerciseList[sel - 1], 70, C_GREY, 1);
+
+    printCentered(exerciseList[sel], 100, GC9A01A_WHITE, 2);
+    int curW = (int)strlen(exerciseList[sel]) * 12;
+    int leftCaretX  = (240 - curW) / 2 - 14;
+    int rightCaretX = (240 + curW) / 2 + 4;
+    if (leftCaretX  > 4)   { tft.setCursor(leftCaretX, 100);  tft.setTextSize(2); tft.setTextColor(GC9A01A_GREEN); tft.print(">"); }
+    if (rightCaretX < 230) { tft.setCursor(rightCaretX, 100); tft.setTextSize(2); tft.setTextColor(GC9A01A_GREEN); tft.print("<"); }
+
+    if (sel + 1 < exerciseCount)
+      printCentered(exerciseList[sel + 1], 140, C_GREY, 1);
+
+    char pos[10];
+    snprintf(pos, sizeof(pos), "%d / %d", sel + 1, exerciseCount);
+    printCentered(pos, 162, C_GREY, 1);
   }
 
-  tft.setTextColor(C_GREY);
-  tft.setTextSize(1);
-  tft.setCursor(6, 165);
-  tft.println("GRN=Start  YEL=Chg Exercise");
-  tft.setCursor(6, 178);
-  tft.println("YEL hold=Calibrate");
-  tft.setCursor(6, 191);
-  tft.println("RED=Eject Player");
-  tft.setCursor(6, 204);
-  tft.println("RED hold=Sleep");
+  printCentered("GRN: Select", 188, C_GREY, 1);
+  printCentered("RED: Down  YEL: Eject", 203, C_GREY, 1);
+  if (calibrated) printCentered("CAL OK", 217, GC9A01A_GREEN, 1);
+}
+
+// CONFIRM_EXERCISE = "Start <name>?" with yes/no. GRN confirms, RED goes back.
+void drawConfirmExercise() {
+  tft.fillScreen(GC9A01A_BLACK);
+
+  char hdr[40]; buildPlayerHeader(hdr, sizeof(hdr));
+  printCentered(hdr, 18, GC9A01A_CYAN, 1);
+
+  printCentered("Start", 60, GC9A01A_WHITE, 2);
+  printCentered(currentExerciseName(), 100, GC9A01A_YELLOW, 2);
+  printCentered("?", 140, GC9A01A_WHITE, 2);
+
+  printCentered("GRN: Yes", 188, GC9A01A_GREEN, 1);
+  printCentered("RED: No", 203, GC9A01A_RED, 1);
+}
+
+// EXERCISE_READY = post-confirm pre-set screen. GRN starts, YEL calibrates, RED cancels.
+void drawExerciseReady() {
+  tft.fillScreen(GC9A01A_BLACK);
+
+  char hdr[40]; buildPlayerHeader(hdr, sizeof(hdr));
+  printCentered(hdr, 18, GC9A01A_CYAN, 1);
+
+  printCentered(currentExerciseName(), 60, GC9A01A_WHITE, 2);
+  printCentered("Ready", 100, GC9A01A_GREEN, 3);
 
   if (calibrated) {
-    tft.setTextColor(GC9A01A_GREEN);
-    tft.setCursor(170, 204);
-    tft.println("CAL OK");
+    printCentered("CAL OK", 142, GC9A01A_GREEN, 1);
+  } else {
+    printCentered("Not calibrated", 142, GC9A01A_YELLOW, 1);
   }
+
+  printCentered("GRN: Start", 178, C_GREY, 1);
+  printCentered("YEL: Calibrate", 193, C_GREY, 1);
+  printCentered("RED: Cancel", 208, C_GREY, 1);
 }
 
 void drawRunning() {
@@ -917,9 +1029,10 @@ void updateDisplay() {
     case SPLASH:          drawSplashScreen(); break;
     case PAIRING:         drawPairingScreen(); break;
     case WAITING_FOR_TAG: drawWaitingForTag(); break;
-    case SELECT_PLAYER:   drawSelectionScreen("Pick Player", candidateCount); break;
-    case SELECT_EXERCISE: drawSelectionScreen("Pick Exercise", NUM_EXERCISES); break;
-    case IDLE:            drawIdle(); break;
+    case SELECT_PLAYER:    drawSelectionScreen("Pick Player", candidateCount); break;
+    case IDLE:             drawIdle(); break;
+    case CONFIRM_EXERCISE: drawConfirmExercise(); break;
+    case EXERCISE_READY:   drawExerciseReady(); break;
     case RUNNING:         drawRunning(); break;
     case CALIBRATING:     drawCalibrating(); break;
     default: break;
@@ -964,7 +1077,8 @@ void processCalibrationSample(float ax, float ay, float az, float gx, float gy, 
     biasGz = calSumGz / CAL_SAMPLES;
     calibrated = true;
     Serial.println("CAL_DONE");
-    state = IDLE;
+    // Calibration is only triggered from EXERCISE_READY; return there.
+    state = EXERCISE_READY;
     displayDirty = true;
   }
 }
@@ -973,7 +1087,8 @@ void processCalibrationSample(float ax, float ay, float az, float gx, float gy, 
 //  SET START / STOP / EJECT
 // ══════════════════════════════════════════════════════════════════════
 void startSet() {
-  if (state != IDLE) return;
+  // Triggered from EXERCISE_READY (post-confirm). Reject if we're elsewhere.
+  if (state != EXERCISE_READY) return;
   if (!playerLoaded) {
     Serial.println("ERROR: no player");
     return;
@@ -987,7 +1102,7 @@ void startSet() {
   samplePoolUsed = 0;
   Serial.print("STARTED_SET  player=");
   Serial.print(currentPlayer.first_name); Serial.print(" "); Serial.print(currentPlayer.last_name);
-  Serial.print("  exercise="); Serial.println(activeExercise);
+  Serial.print("  exercise="); Serial.println(currentExerciseName());
   displayDirty = true;
 }
 
@@ -1152,25 +1267,6 @@ void processVBT(float ax, float ay, float az, float gx_raw, float gy_raw, float 
       break;
     }
   }
-}
-
-// ══════════════════════════════════════════════════════════════════════
-//  DEEP SLEEP
-// ══════════════════════════════════════════════════════════════════════
-void enterDeepSleep() {
-  Serial.println("DEEP_SLEEP");
-  tft.fillScreen(GC9A01A_BLACK);
-  drawCenteredText("Sleeping...", 100, GC9A01A_MAGENTA, 2);
-  drawCenteredText("Press button to wake", 130, C_GREY, 1);
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  delay(100);
-  // Wake on the ladder pin going high (any button press pulls it up).
-  // The ladder uses GPIO7 as ADC input with a 10K pull-down — pressing any
-  // button raises voltage above 1.4V. ext0 wake on RTC IO low/high needs a
-  // digital threshold; safest is a periodic timer wake every 2s and re-check.
-  esp_sleep_enable_timer_wakeup(2ULL * 1000000ULL);
-  esp_deep_sleep_start();
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1345,6 +1441,7 @@ void loop() {
         playerLoaded = true;
         Serial.print("Player: ");
         Serial.print(currentPlayer.first_name); Serial.print(" "); Serial.println(currentPlayer.last_name);
+        loadPlayerExercises(currentPlayer.id);
         state = IDLE;
         displayDirty = true;
       } else {
@@ -1358,8 +1455,9 @@ void loop() {
     return;
   }
 
-  // ── SELECTION SCREENS / IDLE: pure UI, no IMU ──
-  if (state == SELECT_PLAYER || state == SELECT_EXERCISE || state == IDLE) {
+  // ── SELECTION SCREENS / IDLE / CONFIRM / READY: pure UI, no IMU ──
+  if (state == SELECT_PLAYER || state == IDLE
+      || state == CONFIRM_EXERCISE || state == EXERCISE_READY) {
     updateDisplay();
     delay(20);
     return;
